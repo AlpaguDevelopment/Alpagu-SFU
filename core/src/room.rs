@@ -1,23 +1,30 @@
 use crate::{
-    protocol::{ClientMessage, MAX_PEERS, Peer, validate_sdp},
+    protocol::{ClientMessage, MAX_PEERS, PROTOCOL, Peer, validate_sdp},
     signaling::Command,
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     time::{Duration, Instant},
 };
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
     change::{SdpAnswer, SdpOffer, SdpPendingOffer},
-    media::{Direction, MediaData, MediaKind, Mid},
+    media::{Direction, KeyframeRequestKind, MediaData, MediaKind, Mid},
     net::{Protocol, Receive},
 };
 use tokio::sync::mpsc;
 
 type Result<T> = std::result::Result<T, &'static str>;
 pub type Datagram = (SocketAddr, Vec<u8>);
+
+#[derive(Default)]
+struct Batch {
+    media: Vec<(Mid, MediaKind)>,
+    frames: Vec<MediaData>,
+    keyframes: Vec<Mid>,
+}
 
 struct Connection {
     rtc: Rtc,
@@ -30,27 +37,29 @@ impl Connection {
             .set_ice_lite(true)
             .clear_codecs()
             .enable_opus(true, false)
+            .enable_vp8(true)
+            .set_send_buffer_video(1000)
             .build(now);
         rtc.add_local_candidate(Candidate::host(address, "udp").map_err(|_| "Invalid candidate")?)
             .ok_or("Candidate rejected")?;
         Ok(Self { rtc, deadline: now })
     }
-    fn drain(&mut self, datagrams: &mut Vec<Datagram>) -> Result<(Option<Mid>, Vec<MediaData>)> {
-        let mut audio = None;
-        let mut frames = Vec::new();
+    fn drain(&mut self, datagrams: &mut Vec<Datagram>) -> Result<Batch> {
+        let mut batch = Batch::default();
         for _ in 0..4096 {
             match self.rtc.poll_output().map_err(|_| "Media output failed")? {
                 Output::Timeout(deadline) => {
                     self.deadline = deadline;
-                    return Ok((audio, frames));
+                    return Ok(batch);
                 }
                 Output::Transmit(packet) => {
                     datagrams.push((packet.destination, packet.contents.to_vec()))
                 }
-                Output::Event(Event::MediaAdded(media)) if media.kind == MediaKind::Audio => {
-                    audio = Some(media.mid)
+                Output::Event(Event::MediaAdded(media)) => {
+                    batch.media.push((media.mid, media.kind))
                 }
-                Output::Event(Event::MediaData(data)) => frames.push(data),
+                Output::Event(Event::MediaData(data)) => batch.frames.push(data),
+                Output::Event(Event::KeyframeRequest(request)) => batch.keyframes.push(request.mid),
                 _ => {}
             }
         }
@@ -61,6 +70,8 @@ impl Connection {
 struct Slot {
     mid: Mid,
     source: Option<u64>,
+    kind: MediaKind,
+    awaiting_keyframe: bool,
 }
 struct Participant {
     peer: Peer,
@@ -69,6 +80,9 @@ struct Participant {
     subscriber: Connection,
     published: bool,
     audio: Option<Mid>,
+    video: Option<Mid>,
+    request_keyframe: bool,
+    last_keyframe_request: Option<Instant>,
     slots: Vec<Slot>,
     pending: Option<SdpPendingOffer>,
     failed: bool,
@@ -79,31 +93,58 @@ impl Participant {
             self.failed = true;
         }
     }
-    fn subscriptions(&mut self, sources: &[u64]) {
+    fn subscriptions(&mut self, sources: &[(u64, MediaKind)]) {
         if self.pending.is_some() {
             return;
         }
-        let mut changes = self.subscriber.rtc.sdp_api();
+        // Retire departed sources in a separate negotiation before assigning their slots.
+        let mut retiring = Vec::new();
         for slot in &mut self.slots {
-            if slot.source.is_some_and(|id| !sources.contains(&id)) {
+            if slot
+                .source
+                .is_some_and(|id| !sources.contains(&(id, slot.kind)))
+            {
                 slot.source = None;
-                changes.set_direction(slot.mid, Direction::Inactive);
+                slot.awaiting_keyframe = slot.kind == MediaKind::Video;
+                retiring.push(slot.mid);
+                // Drop cached packets and use fresh SSRCs so old-source RTX cannot leak
+                // into the next publication. Keep the m-line reusable (not stopped).
+                let mut direct = self.subscriber.rtc.direct_api();
+                let ssrc = direct.new_ssrc();
+                let rtx = (slot.kind == MediaKind::Video).then(|| direct.new_ssrc());
+                direct.reset_stream_tx(slot.mid, None, ssrc, rtx);
             }
         }
-        for &id in sources {
-            if self.slots.iter().any(|slot| slot.source == Some(id)) {
-                continue;
-            }
-            if let Some(slot) = self.slots.iter_mut().find(|slot| slot.source.is_none()) {
-                slot.source = Some(id);
-                changes.set_direction(slot.mid, Direction::SendOnly);
-            } else {
-                let mid =
-                    changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
-                self.slots.push(Slot {
-                    mid,
-                    source: Some(id),
-                });
+        let mut changes = self.subscriber.rtc.sdp_api();
+        for &mid in &retiring {
+            changes.set_direction(mid, Direction::Inactive);
+        }
+        if retiring.is_empty() {
+            for &(id, kind) in sources {
+                if self
+                    .slots
+                    .iter()
+                    .any(|s| s.source == Some(id) && s.kind == kind)
+                {
+                    continue;
+                }
+                if let Some(slot) = self
+                    .slots
+                    .iter_mut()
+                    .find(|s| s.source.is_none() && s.kind == kind)
+                {
+                    slot.source = Some(id);
+                    slot.awaiting_keyframe = kind == MediaKind::Video;
+                    changes.set_direction(slot.mid, Direction::SendOnly);
+                } else {
+                    let mid = changes.add_media(kind, Direction::SendOnly, None, None, None);
+                    self.slots.push(Slot {
+                        mid,
+                        source: Some(id),
+                        kind,
+                        awaiting_keyframe: kind == MediaKind::Video,
+                    });
+                }
             }
         }
         if let Some((offer, pending)) = changes.apply() {
@@ -112,11 +153,30 @@ impl Participant {
                 .slots
                 .iter()
                 .filter_map(|slot| {
-                    slot.source.map(|source|
-                json!({"mid":slot.mid.to_string(), "peer":source.to_string(), "kind":"audio"}))
+                    slot.source.map(|source| {
+                        json!({"mid":slot.mid.to_string(), "peer":source.to_string(),
+                    "kind":if slot.kind == MediaKind::Audio { "audio" } else { "video" }})
+                    })
                 })
                 .collect();
             self.send(json!({"type":"sub_offer", "sdp":offer.to_sdp_string(), "tracks":tracks}));
+        }
+    }
+    fn drain_subscriber(&mut self, datagrams: &mut Vec<Datagram>, requests: &mut BTreeSet<u64>) {
+        match self.subscriber.drain(datagrams) {
+            Ok(batch) => {
+                for mid in batch.keyframes {
+                    if let Some(source) = self
+                        .slots
+                        .iter()
+                        .find(|s| s.mid == mid && s.kind == MediaKind::Video)
+                        .and_then(|s| s.source)
+                    {
+                        requests.insert(source);
+                    }
+                }
+            }
+            Err(_) => self.failed = true,
         }
     }
 }
@@ -124,12 +184,14 @@ impl Participant {
 pub struct Room {
     peers: BTreeMap<u64, Participant>,
     address: SocketAddr,
+    now: Instant,
 }
 impl Room {
     pub fn new(address: SocketAddr) -> Self {
         Self {
             peers: BTreeMap::new(),
             address,
+            now: Instant::now(),
         }
     }
     pub fn deadline(&self) -> Instant {
@@ -175,12 +237,15 @@ impl Room {
             subscriber: Connection::new(self.address)?,
             published: false,
             audio: None,
+            video: None,
+            request_keyframe: false,
+            last_keyframe_request: None,
             slots: Vec::new(),
             pending: None,
             failed: false,
         };
         let peers: Vec<_> = self.peers.values().map(|p| &p.peer).collect();
-        p.send(json!({"type":"joined", "id":peer.id, "protocol":1, "server":env!("CARGO_PKG_VERSION"), "peers":peers}));
+        p.send(json!({"type":"joined", "id":peer.id, "protocol":PROTOCOL, "server":env!("CARGO_PKG_VERSION"), "peers":peers}));
         self.broadcast(id, json!({"type":"peer_joined", "peer":peer}));
         self.peers.insert(id, p);
         tracing::info!(participants = self.peers.len(), "Participant joined");
@@ -232,6 +297,9 @@ impl Room {
             }
             ClientMessage::State { mic, cam, deaf } => {
                 p.peer.mic = mic;
+                if cam && !p.peer.cam {
+                    p.request_keyframe = true;
+                }
                 p.peer.cam = cam;
                 p.peer.deaf = deaf;
                 self.broadcast(id, json!({"type":"peer_state", "id":id.to_string(), "mic":mic, "cam":cam, "deaf":deaf}));
@@ -252,6 +320,7 @@ impl Room {
         Ok(())
     }
     pub fn receive(&mut self, source: SocketAddr, bytes: &[u8], now: Instant) {
+        self.now = now;
         let Ok(packet) = Receive::new(Protocol::Udp, source, self.address, bytes) else {
             return;
         };
@@ -268,6 +337,7 @@ impl Room {
         }
     }
     pub fn timeout(&mut self, now: Instant) {
+        self.now = now;
         for p in self.peers.values_mut() {
             for c in [&mut p.publisher, &mut p.subscriber] {
                 if c.deadline <= now && c.rtc.handle_input(Input::Timeout(now)).is_err() {
@@ -279,24 +349,35 @@ impl Room {
     pub fn pump(&mut self) -> Vec<Datagram> {
         let mut datagrams = Vec::new();
         let mut frames = Vec::new();
+        let mut requests = BTreeSet::new();
         for (&id, p) in &mut self.peers {
             match p.publisher.drain(&mut datagrams) {
-                Ok((audio, incoming)) => {
-                    if let Some(mid) = audio {
-                        p.audio = Some(mid);
+                Ok(batch) => {
+                    for (mid, kind) in batch.media {
+                        match kind {
+                            MediaKind::Audio => p.audio = Some(mid),
+                            MediaKind::Video => p.video = Some(mid),
+                        }
                     }
-                    frames.extend(
-                        incoming
-                            .into_iter()
-                            .filter(|data| p.audio == Some(data.mid))
-                            .map(|data| (id, data)),
-                    );
+                    for data in batch.frames {
+                        let kind = if p.audio == Some(data.mid) {
+                            MediaKind::Audio
+                        } else if p.video == Some(data.mid) {
+                            MediaKind::Video
+                        } else {
+                            continue;
+                        };
+                        // Bound the size of frames retained during fanout.
+                        if data.data.len() <= 512 * 1024 {
+                            frames.push((id, kind, data));
+                        } else if kind == MediaKind::Video {
+                            requests.insert(id);
+                        }
+                    }
                 }
                 Err(_) => p.failed = true,
             }
-            if p.subscriber.drain(&mut datagrams).is_err() {
-                p.failed = true;
-            }
+            p.drain_subscriber(&mut datagrams, &mut requests);
         }
         let failed: Vec<_> = self
             .peers
@@ -310,49 +391,97 @@ impl Room {
         let sources: Vec<_> = self
             .peers
             .iter()
-            .filter(|(_, p)| p.audio.is_some())
-            .map(|(&id, _)| id)
+            .flat_map(|(&id, p)| {
+                [(p.audio, MediaKind::Audio), (p.video, MediaKind::Video)]
+                    .into_iter()
+                    .filter_map(move |(mid, kind)| mid.map(|_| (id, kind)))
+            })
             .collect();
         for (&id, p) in &mut self.peers {
             p.subscriptions(
                 &sources
                     .iter()
                     .copied()
-                    .filter(|source| *source != id)
+                    .filter(|(source, _)| *source != id)
                     .collect::<Vec<_>>(),
             );
-            if p.subscriber.drain(&mut datagrams).is_err() {
-                p.failed = true;
+            p.drain_subscriber(&mut datagrams, &mut requests);
+            if p.pending.is_none() && p.subscriber.rtc.is_connected() {
+                for slot in &p.slots {
+                    if slot.awaiting_keyframe
+                        && let Some(source) = slot.source
+                    {
+                        requests.insert(source);
+                    }
+                }
             }
         }
-        for (source, data) in frames {
+        for (source, kind, data) in frames {
+            if !self.peers.contains_key(&source) {
+                continue;
+            }
             for p in self.peers.values_mut() {
-                if p.pending.is_some() || p.failed {
+                if p.pending.is_some() || p.failed || !p.subscriber.rtc.is_connected() {
                     continue;
                 }
-                let Some(mid) = p
+                let Some(slot) = p
                     .slots
-                    .iter()
-                    .find(|slot| slot.source == Some(source))
-                    .map(|slot| slot.mid)
+                    .iter_mut()
+                    .find(|s| s.source == Some(source) && s.kind == kind)
                 else {
                     continue;
                 };
-                if let Some(writer) = p.subscriber.rtc.writer(mid)
-                    && let Some(pt) = writer.match_params(data.params)
-                {
-                    // Preserve the publisher's media clock and map its codec to the subscriber's PT.
-                    if writer
-                        .write(pt, data.network_time, data.time, data.data.clone())
-                        .is_err()
-                    {
-                        tracing::debug!("Audio frame could not be forwarded");
+                if kind == MediaKind::Video {
+                    if !data.contiguous {
+                        slot.awaiting_keyframe = true;
+                    }
+                    if slot.awaiting_keyframe && !data.is_keyframe() {
+                        requests.insert(source);
+                        continue;
                     }
                 }
-                // str0m requires draining after every write, including within one input batch.
-                if p.subscriber.drain(&mut datagrams).is_err() {
-                    p.failed = true;
+                if let Some(writer) = p.subscriber.rtc.writer(slot.mid)
+                    && let Some(pt) = writer.match_params(data.params)
+                {
+                    if writer
+                        .write(pt, data.network_time, data.time, data.data.clone())
+                        .is_ok()
+                    {
+                        slot.awaiting_keyframe = false;
+                    } else if kind == MediaKind::Video {
+                        slot.awaiting_keyframe = true;
+                        requests.insert(source);
+                    }
                 }
+                // Drain after every write; this also handles downstream recovery feedback.
+                p.drain_subscriber(&mut datagrams, &mut requests);
+            }
+        }
+        for (&id, p) in &mut self.peers {
+            p.request_keyframe |= requests.contains(&id);
+            if !p.request_keyframe
+                || !p.publisher.rtc.is_connected()
+                || p.last_keyframe_request.is_some_and(|last| {
+                    self.now.saturating_duration_since(last) < Duration::from_millis(500)
+                })
+            {
+                continue;
+            }
+            let Some(mut writer) = p.video.and_then(|mid| p.publisher.rtc.writer(mid)) else {
+                continue;
+            };
+            let kind = if writer.is_request_keyframe_possible(KeyframeRequestKind::Pli) {
+                KeyframeRequestKind::Pli
+            } else {
+                KeyframeRequestKind::Fir
+            };
+            // Before the first RTP packet the receiving SSRC may be unknown; retry later.
+            if writer.request_keyframe(None, kind).is_ok() {
+                p.request_keyframe = false;
+                p.last_keyframe_request = Some(self.now);
+            }
+            if p.publisher.drain(&mut datagrams).is_err() {
+                p.failed = true;
             }
         }
         datagrams

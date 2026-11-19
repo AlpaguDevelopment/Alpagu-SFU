@@ -210,14 +210,14 @@ mod socket_tests {
         let (mut first, _) = connect_async(&url).await.unwrap();
         send(
             &mut first,
-            json!({"type":"join","name":"First","protocol":1}),
+            json!({"type":"join","name":"First","protocol":2}),
         )
         .await;
         assert_eq!(receive(&mut first).await["type"], "joined");
         let (mut second, _) = connect_async(&url).await.unwrap();
         send(
             &mut second,
-            json!({"type":"join","name":"Second","protocol":1}),
+            json!({"type":"join","name":"Second","protocol":2}),
         )
         .await;
         assert_eq!(
@@ -242,7 +242,7 @@ mod socket_tests {
         let (mut invalid, _) = connect_async(&url).await.unwrap();
         send(
             &mut invalid,
-            json!({"type":"join","name":"Invalid","protocol":2}),
+            json!({"type":"join","name":"Invalid","protocol":1}),
         )
         .await;
         assert_eq!(receive(&mut invalid).await["fatal"], true);
@@ -250,7 +250,7 @@ mod socket_tests {
         let (mut oversized, _) = connect_async(&url).await.unwrap();
         send(
             &mut oversized,
-            json!({"type":"join","name":"Large","protocol":1}),
+            json!({"type":"join","name":"Large","protocol":2}),
         )
         .await;
         receive(&mut oversized).await;

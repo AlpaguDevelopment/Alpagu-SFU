@@ -1,5 +1,5 @@
 // Signaling and two PeerConnections (pub/sub). Contract: ../../docs/protocol.md
-export const PROTOCOL = 1;
+export const PROTOCOL = 2;
 
 export type Peer = { id: string; name: string; mic: boolean; cam: boolean; deaf: boolean };
 export type Kind = 'audio' | 'video';
@@ -18,6 +18,7 @@ type ServerMsg =
   | { type: 'error'; message: string; fatal: boolean };
 
 export type Events = {
+  published(): void;
   joined(selfId: string, server: string, peers: Peer[]): void;
   peerJoined(peer: Peer): void;
   peerLeft(id: string): void;
@@ -44,8 +45,12 @@ export class SfuClient {
   private assigned = new Map<string, MediaStreamTrack>();
   private pingTimer: number | undefined;
   private closedOnce = false;
+  private publishReady = false;
+  private ev: Events;
 
-  constructor(private ev: Events) {}
+  constructor(ev: Events) { this.ev = ev; }
+
+  canPublishVideo() { return this.publishReady && !this.closedOnce; }
 
   join(name: string, micTrack: MediaStreamTrack | null) {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -84,7 +89,7 @@ export class SfuClient {
   }
 
   async setCamera(track: MediaStreamTrack | null) {
-    if (!this.videoSender) return;
+    if (!this.videoSender || !this.canPublishVideo()) throw new Error('Publication is not ready');
     await this.videoSender.replaceTrack(track);
     if (!track) return;
     try {
@@ -102,7 +107,8 @@ export class SfuClient {
     switch (msg.type) {
       case 'joined':
         if (msg.protocol !== PROTOCOL) {
-          this.ev.log(`WARNING protocol mismatch: client ${PROTOCOL}, server ${msg.protocol}`);
+          this.shutdown(`Protocol mismatch: client ${PROTOCOL}, server ${msg.protocol}`);
+          return;
         }
         this.ev.joined(msg.id, msg.server, msg.peers);
         await this.startPublish(micTrack);
@@ -115,6 +121,8 @@ export class SfuClient {
         return this.ev.peerState(msg.id, msg);
       case 'pub_answer':
         await this.pub?.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+        this.publishReady = true;
+        this.ev.published();
         this.ev.log('pub answer applied');
         return;
       case 'sub_offer':
@@ -214,6 +222,7 @@ export class SfuClient {
   private shutdown(reason: string) {
     if (this.closedOnce) return;
     this.closedOnce = true;
+    this.publishReady = false;
     window.clearInterval(this.pingTimer);
     this.pub?.close();
     this.sub?.close();

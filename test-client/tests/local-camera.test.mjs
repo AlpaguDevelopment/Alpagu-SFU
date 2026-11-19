@@ -60,3 +60,43 @@ test('invalid camera stream releases all acquired tracks', async () => {
   await assert.rejects(camera.start(async () => stream), /no video track/);
   assert.equal(stream.track.readyState, 'ended');
 });
+
+
+test('publication failure releases capture and allows retry', async () => {
+  const camera = new LocalCamera();
+  const failed = capture();
+  await assert.rejects(camera.start(async () => failed, async () => { throw new Error('replaceTrack failed'); }), /replaceTrack failed/);
+  assert.equal(failed.track.readyState, 'ended');
+  const retry = capture();
+  assert.equal(await camera.start(async () => retry, async () => {}), retry.track);
+  camera.stop();
+  assert.equal(retry.track.readyState, 'ended');
+});
+
+test('leaving during publication releases capture and ignores completion', async () => {
+  const camera = new LocalCamera();
+  const stream = capture();
+  let complete;
+  const pending = camera.start(async () => stream, () => new Promise((resolve) => { complete = resolve; }));
+  await Promise.resolve();
+  camera.stop();
+  assert.equal(stream.track.readyState, 'ended');
+  complete();
+  assert.equal(await pending, null);
+});
+
+test('late publication failure cannot stop a newer session capture', async () => {
+  const camera = new LocalCamera();
+  const old = capture();
+  let reject;
+  const pending = camera.start(async () => old, () => new Promise((_, fail) => { reject = fail; }));
+  await Promise.resolve();
+  const current = capture();
+  await camera.start(async () => current, async () => {});
+  reject(new Error('Old connection closed'));
+  await assert.rejects(pending, /Old connection closed/);
+  assert.equal(old.track.readyState, 'ended');
+  assert.equal(current.track.readyState, 'live');
+  camera.stop();
+  assert.equal(current.track.readyState, 'ended');
+});

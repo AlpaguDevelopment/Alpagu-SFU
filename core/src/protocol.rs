@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub const PROTOCOL: u32 = 2;
 pub const MAX_MESSAGE: usize = 64 * 1024;
 pub const MAX_PEERS: usize = 16;
 
@@ -57,7 +58,7 @@ pub fn parse(text: &str) -> Result<ClientMessage, &'static str> {
 }
 
 pub fn validate_join(name: &str, protocol: u32) -> Result<(), &'static str> {
-    if protocol != 1 {
+    if protocol != PROTOCOL {
         return Err("Unsupported protocol");
     }
     if !(1..=32).contains(&name.chars().count())
@@ -85,8 +86,12 @@ pub fn validate_sdp(sdp: &str, publish: bool) -> Result<(), &'static str> {
             return Err("Expected one audio and at most one video track");
         }
     } else if media.is_empty()
-        || media.len() >= MAX_PEERS
-        || media.iter().any(|m| !m.starts_with("m=audio "))
+        || media.len() > 2 * (MAX_PEERS - 1)
+        || media.iter().filter(|m| m.starts_with("m=audio ")).count() >= MAX_PEERS
+        || media.iter().filter(|m| m.starts_with("m=video ")).count() >= MAX_PEERS
+        || media
+            .iter()
+            .any(|m| !m.starts_with("m=audio ") && !m.starts_with("m=video "))
     {
         return Err("Invalid subscription media");
     }
@@ -98,16 +103,16 @@ mod tests {
     use super::*;
     #[test]
     fn validates_names_and_protocol() {
-        assert!(validate_join(&"ş".repeat(32), 1).is_ok());
+        assert!(validate_join(&"ş".repeat(32), PROTOCOL).is_ok());
         for name in [
             "".to_owned(),
             " ".to_owned(),
             "a\nb".to_owned(),
             "a".repeat(33),
         ] {
-            assert!(validate_join(&name, 1).is_err());
+            assert!(validate_join(&name, PROTOCOL).is_err());
         }
-        assert!(validate_join("Alice", 2).is_err());
+        assert!(validate_join("Alice", 1).is_err());
     }
     #[test]
     fn rejects_bad_messages() {
@@ -135,6 +140,10 @@ mod tests {
             .is_ok()
         );
         assert!(validate_sdp("m=application 9 UDP/DTLS/SCTP webrtc-datachannel", true).is_err());
+        let mixed = "m=audio 9 RTP/AVP 111\nm=video 9 RTP/AVP 96\n".repeat(15);
+        assert!(validate_sdp(&mixed, false).is_ok());
+        assert!(validate_sdp(&(mixed + "m=video 9 RTP/AVP 96\n"), false).is_err());
+        assert!(validate_sdp(&"m=video 9 RTP/AVP 96\n".repeat(16), false).is_err());
         assert!(validate_sdp(&"m=audio 9 RTP/AVP 111\n".repeat(16), false).is_err());
     }
 }
