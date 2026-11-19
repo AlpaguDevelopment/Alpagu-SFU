@@ -2,6 +2,8 @@
 
 Build a small working media path first, then improve reliability, control, coverage, and measurement. Each milestone must pass automated checks and desktop/phone regression tests before the next begins. These are planned capabilities, not promises or current features.
 
+**Current release:** v0.2.0; automated checks and desktop/phone acceptance passed. Next: v0.3 disconnect cleanup and reconnection. Mobile background suspension remains a known limitation.
+
 | Version | Milestone | Acceptance focus |
 |---|---|---|
 | 0.1 | Single-room Opus audio, ICE-lite, shared UDP, bounded signaling, local deafen | Two/three participants; mute/deafen; ten join/leave cycles; zero remaining participants |

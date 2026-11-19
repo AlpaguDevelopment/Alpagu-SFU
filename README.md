@@ -6,13 +6,15 @@ The project is developed using AI models **GPT-6 Astra, Claude Opus 5.5, and Cla
 
 ## Status
 
-**v0.1.0 is an experimental LAN audio release.** It supports one room, up to 16 participants, Opus audio, microphone/deafen state, and a browser test client. Each participant has separate publish and subscribe connections; all media shares one UDP port.
+**v0.2.0 is an experimental LAN audio and video release.** It adds VP8 camera forwarding, keyframe requests, and NACK/RTX recovery to the single-room Opus audio path. Up to 16 participants share one UDP media port, with separate publish and subscribe connections.
 
-Camera in the test client is **local preview only**. Video forwarding, authentication, multiple rooms, TURN, signaling TLS in the core, and automatic reconnection are not implemented. Run this version on a trusted local network, not as a public Internet service.
+Upgrade the server and test client together: v0.2 uses **protocol 2**, incompatible with v0.1 clients. Authentication, multiple rooms, TURN, signaling TLS in the core, and automatic reconnection are not implemented. Use a trusted local network.
+
+Mobile browsers may pause camera capture while backgrounded, leaving the last frame visible remotely. Video resumes on return while the connection survives; longer background periods can disconnect the session. Automatic reconnection is planned for v0.3. Rejoin manually after a disconnect.
 
 ## Run the Windows release
 
-1. Download `Alpagu-SFU-v0.1.0-windows-x64.zip` from [Releases](https://github.com/AlpaguDevelopment/Alpagu-SFU/releases).
+1. Download `Alpagu-SFU-v0.2.0-windows-x64.zip` from [Releases](https://github.com/AlpaguDevelopment/Alpagu-SFU/releases).
 2. Extract it. Open PowerShell in the extracted directory.
 3. Find your active LAN IPv4 address with `ipconfig`, then run:
 
@@ -31,6 +33,7 @@ Requirements: stable Rust (tested with 1.100.0), and the platform's native build
 ```powershell
 git clone https://github.com/AlpaguDevelopment/Alpagu-SFU.git
 cd Alpagu-SFU
+git switch --detach v0.2.0
 cargo run --manifest-path core/Cargo.toml --release --locked -- --ip <LAN-IP>
 ```
 
@@ -54,7 +57,7 @@ npm run dev
 
 - Computer: open `https://localhost:5173`.
 - Phone on the same network: open `https://<LAN-IP>:5173`.
-- Accept the local development certificate warning and grant microphone access.
+- Accept the local development certificate warning and grant microphone access. For v0.2, turn on both cameras and grant camera access to test two-way video.
 - Join with different names and speak in both directions. Use headphones to avoid feedback.
 - If playback is blocked, press **Tap to enable audio**.
 
@@ -67,7 +70,7 @@ The HTTPS development server proxies `/ws` to the core. The core executable does
 | `--ip` | `127.0.0.1` | IPv4 address advertised to browsers; use the server's LAN address for phones |
 | `--port` | `7880` | Signaling TCP port, bound to all IPv4 interfaces |
 | `--udp-port` | `7882` | Shared media UDP port, bound to all IPv4 interfaces |
-| `--version` | | Print `0.1.0` and exit |
+| `--version` | | Print the core version and exit |
 | `--help` | | Show command-line usage |
 
 The test client's HTTPS port is **5173/TCP**. Allow that port and **7882/UDP** on your private network. The client proxy connects locally to **7880/TCP** by default. If the core uses a different signaling port, set the proxy target before starting Vite:
@@ -83,7 +86,7 @@ npm run dev
 
 See [testing instructions](docs/testing.md) for automated checks, the desktop/phone checklist, and troubleshooting.
 
-- [Protocol v1](docs/protocol.md)
+- [Protocol v2](docs/protocol.md)
 - [Roadmap](docs/roadmap.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)

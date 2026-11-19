@@ -62,9 +62,13 @@ struct Client {
     sub_addr: SocketAddr,
     pending: Option<SdpPendingOffer>,
     mid: Mid,
+    video_mid: Mid,
+    video_tick: u64,
+    keyframe_requests: usize,
     rx: mpsc::Receiver<Value>,
     received: Vec<(Mid, Vec<u8>)>,
     mapping: Vec<Value>,
+    max_media_lines: usize,
 }
 impl Client {
     fn new(room: &mut Room, id: u64, now: Instant) -> Self {
@@ -77,7 +81,7 @@ impl Client {
             .unwrap();
         let mut changes = publisher.sdp_api();
         let mid = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
-        changes.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let video_mid = changes.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
         let (offer, pending) = changes.apply().unwrap();
         room.command(Command::Message {
             id,
@@ -97,9 +101,13 @@ impl Client {
             sub_addr,
             pending: Some(pending),
             mid,
+            video_mid,
+            video_tick: 0,
+            keyframe_requests: 0,
             rx,
             received: Vec::new(),
             mapping: Vec::new(),
+            max_media_lines: 0,
         }
     }
     fn signal(&mut self, room: &mut Room) -> bool {
@@ -116,6 +124,14 @@ impl Client {
                         .unwrap();
                 }
                 "sub_offer" => {
+                    self.max_media_lines = self.max_media_lines.max(
+                        value["sdp"]
+                            .as_str()
+                            .unwrap()
+                            .lines()
+                            .filter(|line| line.starts_with("m="))
+                            .count(),
+                    );
                     self.mapping = value["tracks"].as_array().unwrap().clone();
                     let offer = SdpOffer::from_sdp_string(value["sdp"].as_str().unwrap()).unwrap();
                     let answer = self.subscriber.sdp_api().accept_offer(offer).unwrap();
@@ -146,6 +162,7 @@ impl Client {
                     Output::Event(Event::MediaData(data)) => {
                         self.received.push((data.mid, data.data.to_vec()))
                     }
+                    Output::Event(Event::KeyframeRequest(_)) => self.keyframe_requests += 1,
                     _ => {}
                 }
             }
@@ -168,8 +185,65 @@ impl Client {
             )
             .unwrap();
     }
+    fn write_video(&mut self, now: Instant, keyframe: bool) -> Vec<u8> {
+        let writer = self.publisher.writer(self.video_mid).unwrap();
+        let pt = writer
+            .payload_params()
+            .find(|p| p.spec().codec == str0m::format::Codec::Vp8)
+            .unwrap()
+            .pt();
+        // Synthetic encoded-frame fixture: enough header for VP8 packetization/keyframe detection.
+        // This tests transport integrity, not decoding or visual quality.
+        let mut frame = vec![self.id as u8; 3000];
+        frame[..10].copy_from_slice(&[
+            if keyframe { 0x10 } else { 0x11 },
+            0,
+            0,
+            0x9d,
+            1,
+            0x2a,
+            0x80,
+            2,
+            0xe0,
+            1,
+        ]);
+        self.video_tick += 1;
+        writer
+            .write(
+                pt,
+                now,
+                MediaTime::from_millis(self.video_tick * 33),
+                frame.clone(),
+            )
+            .unwrap();
+        frame
+    }
+    fn request_video_keyframe(&mut self, source: u64, kind: KeyframeRequestKind) {
+        let source = source.to_string();
+        let mid = self
+            .mapping
+            .iter()
+            .find(|t| t["peer"].as_str() == Some(source.as_str()) && t["kind"] == "video")
+            .unwrap()["mid"]
+            .as_str()
+            .unwrap();
+        self.subscriber
+            .writer(Mid::from(mid))
+            .unwrap()
+            .request_keyframe(None, kind)
+            .unwrap();
+    }
+}
+#[derive(Default)]
+struct Network {
+    loss: Option<(SocketAddr, SocketAddr, u8, usize)>,
+    dropped: bool,
+    rtx: usize,
 }
 fn exchange(room: &mut Room, clients: &mut [Client], now: Instant) {
+    exchange_network(room, clients, now, &mut Network::default());
+}
+fn exchange_network(room: &mut Room, clients: &mut [Client], now: Instant, network: &mut Network) {
     let mut queue = VecDeque::new();
     for _ in 0..200 {
         let mut signal = false;
@@ -184,6 +258,25 @@ fn exchange(room: &mut Room, clients: &mut [Client], now: Instant) {
             return;
         }
         while let Some((source, destination, bytes)) = queue.pop_front() {
+            let rtp = bytes.len() >= 12 && bytes[0] >> 6 == 2;
+            // The synthetic clients negotiate the library's default VP8/RTX PTs (96/97).
+            if rtp && bytes[1] & 0x7f == 97 {
+                network.rtx += 1;
+            }
+            if let Some((from, to, pt, skip)) = &mut network.loss
+                && source == *from
+                && destination == *to
+                && rtp
+                && bytes[1] & 0x7f == *pt
+            {
+                if *skip > 0 {
+                    *skip -= 1;
+                } else {
+                    network.loss = None;
+                    network.dropped = true;
+                    continue;
+                }
+            }
             if destination == room.address {
                 room.receive(source, &bytes, now);
                 for (destination, bytes) in room.pump() {
@@ -240,13 +333,13 @@ fn forwards_opus_between_three_peers_and_removes_departed_tracks() {
     advance(&mut room, &mut clients, &mut now, 100, false);
     advance(&mut room, &mut clients, &mut now, 30, true);
     for client in &clients {
-        assert_eq!(client.mapping.len(), 2);
+        assert_eq!(client.mapping.len(), 4);
         assert!(
             !client.received.is_empty(),
             "Peer {} received no audio",
             client.id
         );
-        for track in &client.mapping {
+        for track in client.mapping.iter().filter(|t| t["kind"] == "audio") {
             assert!(client.received.iter().any(|(mid, data)| mid.to_string()
                 == track["mid"].as_str().unwrap()
                 && data == &[0xf8, 0xff, 0xfe]));
@@ -256,7 +349,7 @@ fn forwards_opus_between_three_peers_and_removes_departed_tracks() {
     room.command(Command::Left(3));
     exchange(&mut room, &mut clients, now);
     for client in &clients {
-        assert_eq!(client.mapping.len(), 1);
+        assert_eq!(client.mapping.len(), 2);
     }
     clients.push(Client::new(&mut room, 4, now));
     exchange(&mut room, &mut clients, now);
@@ -266,11 +359,11 @@ fn forwards_opus_between_three_peers_and_removes_departed_tracks() {
     }
     advance(&mut room, &mut clients, &mut now, 30, true);
     for client in &clients {
-        assert_eq!(client.mapping.len(), 2);
+        assert_eq!(client.mapping.len(), 4);
         assert!(!client.received.is_empty());
         assert!(client.mapping.iter().all(|t| t["peer"] != "3"));
     }
-    assert!(room.peers.values().all(|p| p.slots.len() == 2));
+    assert!(room.peers.values().all(|p| p.slots.len() == 4));
 }
 
 #[test]
@@ -279,9 +372,9 @@ fn defers_subscription_changes_until_answer() {
     let mut rx = join(&mut room, 1);
     rx.try_recv().unwrap();
     let peer = room.peers.get_mut(&1).unwrap();
-    peer.subscriptions(&[2]);
+    peer.subscriptions(&[(2, MediaKind::Audio)]);
     let offer = rx.try_recv().unwrap();
-    peer.subscriptions(&[2, 3]);
+    peer.subscriptions(&[(2, MediaKind::Audio), (3, MediaKind::Audio)]);
     assert!(rx.try_recv().is_err());
     assert_eq!(peer.slots.len(), 1);
     let mut client = Rtc::new(Instant::now());
@@ -296,9 +389,206 @@ fn defers_subscription_changes_until_answer() {
         },
     )
     .unwrap();
-    room.peers.get_mut(&1).unwrap().subscriptions(&[2, 3]);
+    room.peers
+        .get_mut(&1)
+        .unwrap()
+        .subscriptions(&[(2, MediaKind::Audio), (3, MediaKind::Audio)]);
     assert_eq!(
         rx.try_recv().unwrap()["tracks"].as_array().unwrap().len(),
         2
     );
+}
+
+fn video_room() -> (Room, Vec<Client>, Instant) {
+    let mut room = test_room();
+    let mut now = Instant::now();
+    let mut clients: Vec<_> = (1..=3).map(|id| Client::new(&mut room, id, now)).collect();
+    exchange(&mut room, &mut clients, now);
+    advance(&mut room, &mut clients, &mut now, 100, false);
+    for client in &mut clients {
+        client.write_video(now, true);
+    }
+    exchange(&mut room, &mut clients, now);
+    advance(&mut room, &mut clients, &mut now, 40, false);
+    (room, clients, now)
+}
+
+#[test]
+fn forwards_vp8_and_routes_pli_and_fir_to_the_correct_publisher() {
+    let (mut room, mut clients, mut now) = video_room();
+    for client in &clients {
+        for track in client.mapping.iter().filter(|t| t["kind"] == "video") {
+            let source: u8 = track["peer"].as_str().unwrap().parse().unwrap();
+            assert!(client.received.iter().any(|(mid, data)| mid.to_string()
+                == track["mid"].as_str().unwrap()
+                && data.last() == Some(&source)));
+        }
+    }
+    for kind in [KeyframeRequestKind::Pli, KeyframeRequestKind::Fir] {
+        for c in &mut clients {
+            c.keyframe_requests = 0;
+        }
+        clients[1].request_video_keyframe(1, kind);
+        exchange(&mut room, &mut clients, now);
+        advance(&mut room, &mut clients, &mut now, 30, false);
+        assert!(clients[0].keyframe_requests > 0);
+        assert_eq!(clients[1].keyframe_requests, 0);
+        assert_eq!(clients[2].keyframe_requests, 0);
+    }
+}
+
+#[test]
+fn new_subscriber_waits_for_keyframe_and_recycled_slots_do_not_mix_publishers() {
+    let (mut room, mut clients, mut now) = video_room();
+    let original_mid = clients[0]
+        .mapping
+        .iter()
+        .find(|t| t["peer"] == "3" && t["kind"] == "video")
+        .unwrap()["mid"]
+        .clone();
+    let video_mid: Mid = original_mid.as_str().unwrap().into();
+    let old_ssrc = room
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .subscriber
+        .rtc
+        .direct_api()
+        .stream_tx_by_mid(video_mid, None)
+        .unwrap()
+        .ssrc();
+    clients.pop();
+    room.command(Command::Left(3));
+    exchange(&mut room, &mut clients, now);
+    clients.push(Client::new(&mut room, 4, now));
+    exchange(&mut room, &mut clients, now);
+    advance(&mut room, &mut clients, &mut now, 100, false);
+    for c in &mut clients {
+        c.received.clear();
+        c.keyframe_requests = 0;
+    }
+    // A new publisher cannot feed dependent frames into a recycled decoder.
+    let delta = clients[2].write_video(now, false);
+    exchange(&mut room, &mut clients, now);
+    advance(&mut room, &mut clients, &mut now, 40, false);
+    assert!(!clients[0].received.iter().any(|(_, data)| *data == delta));
+    assert!(clients[2].keyframe_requests > 0);
+    let keyframe = clients[2].write_video(now, true);
+    exchange(&mut room, &mut clients, now);
+    advance(&mut room, &mut clients, &mut now, 20, false);
+    let new_mid = clients[0]
+        .mapping
+        .iter()
+        .find(|t| t["peer"] == "4" && t["kind"] == "video")
+        .unwrap()["mid"]
+        .clone();
+    assert_eq!(original_mid, new_mid);
+    let new_ssrc = room
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .subscriber
+        .rtc
+        .direct_api()
+        .stream_tx_by_mid(video_mid, None)
+        .unwrap()
+        .ssrc();
+    assert_ne!(old_ssrc, new_ssrc);
+
+    assert!(
+        clients[0]
+            .received
+            .iter()
+            .any(|(mid, data)| mid.to_string() == new_mid.as_str().unwrap() && *data == keyframe)
+    );
+    assert!(
+        clients[0]
+            .received
+            .iter()
+            .all(|(_, data)| data.last() != Some(&3))
+    );
+    // Existing viewers retain a bounded SDP while new peers repeatedly replace one another.
+    for id in 5..15 {
+        let departed = clients.pop().unwrap().id;
+        room.command(Command::Left(departed));
+        clients.push(Client::new(&mut room, id, now));
+        exchange(&mut room, &mut clients, now);
+        advance(&mut room, &mut clients, &mut now, 30, false);
+        assert_eq!(clients[0].mapping.len(), 4);
+        assert_eq!(clients[0].max_media_lines, 4);
+    }
+}
+
+#[test]
+fn nack_rtx_recovers_a_lost_video_packet_on_each_transport_leg() {
+    let (mut room, mut clients, mut now) = video_room();
+    for upstream in [true, false] {
+        let (source, destination) = if upstream {
+            (clients[0].pub_addr, room.address)
+        } else {
+            (room.address, clients[1].sub_addr)
+        };
+        let mut network = Network {
+            loss: Some((source, destination, 96, 1)),
+            ..Network::default()
+        };
+        clients[1].received.clear();
+        let frame = clients[0].write_video(now, true);
+        exchange_network(&mut room, &mut clients, now, &mut network);
+        for _ in 0..60 {
+            now += Duration::from_millis(20);
+            room.timeout(now);
+            for c in &mut clients {
+                c.publisher.handle_input(Input::Timeout(now)).unwrap();
+                c.subscriber.handle_input(Input::Timeout(now)).unwrap();
+            }
+            exchange_network(&mut room, &mut clients, now, &mut network);
+        }
+        assert!(network.dropped, "Loss fixture did not drop a packet");
+        assert!(network.rtx > 0, "No RTX observed for upstream={upstream}");
+        assert!(
+            clients[1].received.iter().any(|(_, data)| *data == frame),
+            "Frame was not recovered for upstream={upstream}"
+        );
+    }
+}
+
+#[test]
+fn camera_restart_requests_are_coalesced_and_rate_limited() {
+    let (mut room, mut clients, mut now) = video_room();
+    clients[0].keyframe_requests = 0;
+    for _ in 0..10 {
+        for cam in [false, true] {
+            room.command(Command::Message {
+                id: 1,
+                message: ClientMessage::State {
+                    mic: true,
+                    cam,
+                    deaf: false,
+                },
+            });
+        }
+    }
+    exchange(&mut room, &mut clients, now);
+    advance(&mut room, &mut clients, &mut now, 5, false);
+    assert!(clients[0].keyframe_requests <= 1);
+    advance(&mut room, &mut clients, &mut now, 30, false);
+    assert_eq!(clients[0].keyframe_requests, 1);
+}
+
+#[test]
+fn full_room_negotiates_thirty_subscription_lines_within_sdp_limits() {
+    let mut room = test_room();
+    let mut now = Instant::now();
+    let mut clients: Vec<_> = (1..=16).map(|id| Client::new(&mut room, id, now)).collect();
+    // Certificate generation can take longer than the simulated handshake window.
+    now = Instant::now();
+    exchange(&mut room, &mut clients, now);
+    advance(&mut room, &mut clients, &mut now, 100, false);
+    assert_eq!(room.peers.len(), 16);
+    for client in &clients {
+        assert_eq!(client.mapping.len(), 30);
+        assert_eq!(client.max_media_lines, 30);
+        assert!(client.subscriber.is_connected());
+    }
 }

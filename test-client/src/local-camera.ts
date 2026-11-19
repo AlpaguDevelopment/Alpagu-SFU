@@ -9,7 +9,7 @@ export class LocalCamera {
     this.stream = null;
   }
 
-  async start(acquire: () => Promise<MediaStream>): Promise<MediaStreamTrack | null> {
+  async start(acquire: () => Promise<MediaStream>, publish?: (track: MediaStreamTrack) => Promise<void>): Promise<MediaStreamTrack | null> {
     this.stop();
     const generation = this.generation;
     const stream = await acquire();
@@ -23,6 +23,17 @@ export class LocalCamera {
       throw new Error('Camera returned no video track');
     }
     this.stream = stream;
+    try {
+      await publish?.(track);
+    } catch (error) {
+      stream.getTracks().forEach((item) => item.stop());
+      if (generation === this.generation) this.stream = null;
+      throw error;
+    }
+    if (generation !== this.generation) {
+      stream.getTracks().forEach((item) => item.stop());
+      return null;
+    }
     return track;
   }
 }

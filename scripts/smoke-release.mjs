@@ -5,9 +5,13 @@ import { once } from 'node:events';
 import { createServer } from 'node:net';
 import { createSocket } from 'node:dgram';
 import { resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { PROTOCOL } from '../test-client/src/sfu-client.ts';
+
+const version = JSON.parse(readFileSync(new URL('../test-client/package.json', import.meta.url), 'utf8')).version;
 
 const executable = resolve(process.argv[2] ?? 'core/target/x86_64-pc-windows-msvc/release/sfu-core.exe');
-assert.equal(execFileSync(executable, ['--version'], { encoding: 'utf8', windowsHide: true }).trim(), '0.1.0');
+assert.equal(execFileSync(executable, ['--version'], { encoding: 'utf8', windowsHide: true }).trim(), version);
 const tcp = createServer();
 tcp.listen(0, '127.0.0.1');
 await once(tcp, 'listening');
@@ -35,10 +39,11 @@ async function connect(name) {
   });
   const next = () => queue.length ? Promise.resolve(queue.shift()) : new Promise((done) => waiting.push(done));
   await new Promise((done, fail) => { ws.addEventListener('open', done, { once: true }); ws.addEventListener('error', fail, { once: true }); });
-  ws.send(JSON.stringify({ type: 'join', name, protocol: 1 }));
+  ws.send(JSON.stringify({ type: 'join', name, protocol: PROTOCOL }));
   const joined = await next();
   assert.equal(joined.type, 'joined');
-  assert.equal(joined.server, '0.1.0');
+  assert.equal(joined.protocol, PROTOCOL);
+  assert.equal(joined.server, version);
   return { ws, next, joined };
 }
 try {

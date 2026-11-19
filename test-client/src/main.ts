@@ -2,7 +2,7 @@ import './style.css';
 import { LocalCamera } from './local-camera';
 import { SfuClient, errText, PROTOCOL, type Kind, type Peer } from './sfu-client';
 
-const TEST_CLIENT_VERSION = '0.1.0';
+const TEST_CLIENT_VERSION = '0.2.0';
 const NAME_KEY = 'sfu-test-name';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -120,11 +120,11 @@ function selfInfo(): Peer {
 
 function renderControls() {
   setBtn(btnMic, mic, 'Microphone on', 'Microphone off');
-  setBtn(btnCam, cam, 'Camera on (local)', 'Camera off');
-  if (busy) btnCam.textContent = 'Opening camera…';
+  setBtn(btnCam, cam, 'Camera on', 'Camera off');
+  if (busy) btnCam.textContent = 'Updating camera…';
   setBtn(btnDeaf, !deaf, 'Deafen', 'Undeafen');
   btnMic.disabled = deaf || busy;
-  btnCam.disabled = busy;
+  btnCam.disabled = busy || !client?.canPublishVideo();
   const self = tiles.get(SELF);
   if (self) {
     self.info = selfInfo();
@@ -197,6 +197,7 @@ joinBtn.onclick = async () => {
   renderControls();
 
   client = new SfuClient({
+    published() { renderControls(); },
     joined(selfId, server, peers) {
       statusEl.textContent = `Connected · core ${server}`;
       log(`Joined (id ${selfId}), ${peers.length} other peers`);
@@ -299,22 +300,25 @@ btnCam.onclick = async () => {
   const session = client;
   cameraStatus.textContent = '';
   if (cam) {
+    busy = true;
     localCamera.stop();
     camTrack = null;
     cam = false;
     const self = tiles.get(SELF);
     if (self) self.video.srcObject = null;
-    log('Local camera stopped');
+    log('Camera capture stopped');
     pushState();
+    try { await session.setCamera(null); } catch (err) { log('Camera detach: ' + errText(err)); }
+    finally { if (client === session) { busy = false; renderControls(); } }
     return;
   }
   busy = true;
   renderControls();
   try {
-    // v0.1 supports local preview only; it must not depend on video negotiation.
+    // Capture ownership survives publication errors and late permission responses.
     const track = await localCamera.start(() => navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 }, facingMode: 'user' },
-    }));
+    }), (track) => session.setCamera(track));
     if (!track || client !== session) return;
     camTrack = track;
     cam = true;
@@ -323,8 +327,8 @@ btnCam.onclick = async () => {
       self.video.srcObject = new MediaStream([track]);
       playSafe(self.video);
     }
-    cameraStatus.textContent = 'Only you can see this camera preview; this version does not send video.';
-    log('Local camera started');
+    cameraStatus.textContent = 'Camera is being shared with the room.';
+    log('Camera publication started');
   } catch (err) {
     if (client !== session) return;
     localCamera.stop();
