@@ -1,5 +1,5 @@
 use crate::{
-    protocol::{ClientMessage, MAX_PEERS, PROTOCOL, Peer, validate_sdp},
+    protocol::{ClientMessage, MAX_PEERS, PROTOCOL, Pc, Peer, validate_sdp},
     signaling::Command,
 };
 use serde_json::{Value, json};
@@ -16,6 +16,8 @@ use str0m::{
 };
 use tokio::sync::mpsc;
 
+const MEDIA_TIMEOUT: Duration = Duration::from_secs(15);
+
 type Result<T> = std::result::Result<T, &'static str>;
 pub type Datagram = (SocketAddr, Vec<u8>);
 
@@ -29,6 +31,8 @@ struct Batch {
 struct Connection {
     rtc: Rtc,
     deadline: Instant,
+    media_expires: Option<Instant>,
+    answer_expires: Option<Instant>,
 }
 impl Connection {
     fn new(address: SocketAddr) -> Result<Self> {
@@ -42,7 +46,25 @@ impl Connection {
             .build(now);
         rtc.add_local_candidate(Candidate::host(address, "udp").map_err(|_| "Invalid candidate")?)
             .ok_or("Candidate rejected")?;
-        Ok(Self { rtc, deadline: now })
+        Ok(Self {
+            rtc,
+            deadline: now,
+            media_expires: None,
+            answer_expires: None,
+        })
+    }
+    fn next_deadline(&self) -> Instant {
+        [Some(self.deadline), self.media_expires, self.answer_expires]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(self.deadline)
+    }
+    fn expired(&self, now: Instant) -> bool {
+        [self.media_expires, self.answer_expires]
+            .into_iter()
+            .flatten()
+            .any(|end| now >= end)
     }
     fn drain(&mut self, datagrams: &mut Vec<Datagram>) -> Result<Batch> {
         let mut batch = Batch::default();
@@ -79,6 +101,8 @@ struct Participant {
     publisher: Connection,
     subscriber: Connection,
     published: bool,
+    pub_restart: Option<SdpPendingOffer>,
+    restart_sub: bool,
     audio: Option<Mid>,
     video: Option<Mid>,
     request_keyframe: bool,
@@ -93,7 +117,7 @@ impl Participant {
             self.failed = true;
         }
     }
-    fn subscriptions(&mut self, sources: &[(u64, MediaKind)]) {
+    fn subscriptions(&mut self, sources: &[(u64, MediaKind)], now: Instant) {
         if self.pending.is_some() {
             return;
         }
@@ -110,9 +134,11 @@ impl Participant {
                 // Drop cached packets and use fresh SSRCs so old-source RTX cannot leak
                 // into the next publication. Keep the m-line reusable (not stopped).
                 let mut direct = self.subscriber.rtc.direct_api();
-                let ssrc = direct.new_ssrc();
-                let rtx = (slot.kind == MediaKind::Video).then(|| direct.new_ssrc());
-                direct.reset_stream_tx(slot.mid, None, ssrc, rtx);
+                if let Some(previous) = direct.stream_tx_by_mid(slot.mid, None).map(|tx| tx.ssrc())
+                {
+                    // str0m allocates fresh SSRCs when the reused MID becomes sendonly.
+                    direct.remove_stream_tx(previous);
+                }
             }
         }
         let mut changes = self.subscriber.rtc.sdp_api();
@@ -147,7 +173,14 @@ impl Participant {
                 }
             }
         }
+        if std::mem::take(&mut self.restart_sub) && !self.slots.is_empty() {
+            changes.ice_restart(true);
+        }
         if let Some((offer, pending)) = changes.apply() {
+            self.subscriber
+                .media_expires
+                .get_or_insert(now + MEDIA_TIMEOUT);
+            self.subscriber.answer_expires = Some(now + MEDIA_TIMEOUT);
             self.pending = Some(pending);
             let tracks: Vec<_> = self
                 .slots
@@ -197,11 +230,12 @@ impl Room {
     pub fn deadline(&self) -> Instant {
         self.peers
             .values()
-            .flat_map(|p| [p.publisher.deadline, p.subscriber.deadline])
+            .flat_map(|p| [p.publisher.next_deadline(), p.subscriber.next_deadline()])
             .min()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(1))
     }
     pub fn command(&mut self, command: Command) {
+        self.now = self.now.max(Instant::now());
         match command {
             Command::Join { id, name, tx } => {
                 if let Err(message) = self.join(id, name, tx.clone()) {
@@ -220,6 +254,10 @@ impl Room {
         }
     }
     fn join(&mut self, id: u64, name: String, tx: mpsc::Sender<Value>) -> Result<()> {
+        let name = name.trim().to_owned();
+        if self.peers.values().any(|p| p.peer.name == name) {
+            return Err("Name is already in use");
+        }
         if self.peers.len() >= MAX_PEERS {
             return Err("Room is full");
         }
@@ -236,6 +274,8 @@ impl Room {
             publisher: Connection::new(self.address)?,
             subscriber: Connection::new(self.address)?,
             published: false,
+            pub_restart: None,
+            restart_sub: false,
             audio: None,
             video: None,
             request_keyframe: false,
@@ -244,6 +284,7 @@ impl Room {
             pending: None,
             failed: false,
         };
+        p.publisher.media_expires = Some(self.now + MEDIA_TIMEOUT);
         let peers: Vec<_> = self.peers.values().map(|p| &p.peer).collect();
         p.send(json!({"type":"joined", "id":peer.id, "protocol":PROTOCOL, "server":env!("CARGO_PKG_VERSION"), "peers":peers}));
         self.broadcast(id, json!({"type":"peer_joined", "peer":peer}));
@@ -284,6 +325,39 @@ impl Room {
                 p.published = true;
                 p.send(json!({"type":"pub_answer", "sdp":answer.to_sdp_string()}));
             }
+            ClientMessage::RestartIce { pc: Pc::Pub } => {
+                if !p.published {
+                    return Err("Publication has not been negotiated");
+                }
+                if p.pub_restart.is_none() {
+                    let mut changes = p.publisher.rtc.sdp_api();
+                    changes.ice_restart(true);
+                    let (offer, pending) =
+                        changes.apply().ok_or("Cannot restart publication ICE")?;
+                    p.pub_restart = Some(pending);
+                    p.publisher.answer_expires = Some(self.now + MEDIA_TIMEOUT);
+                    p.send(json!({"type":"pub_restart_offer", "sdp":offer.to_sdp_string()}));
+                }
+            }
+            ClientMessage::RestartIce { pc: Pc::Sub } => {
+                p.restart_sub = true;
+            }
+            ClientMessage::PubRestartAnswer { sdp } => {
+                validate_sdp(&sdp, true)?;
+                let pending = p
+                    .pub_restart
+                    .take()
+                    .ok_or("Unexpected publication restart answer")?;
+                let answer = SdpAnswer::from_sdp_string(&sdp)
+                    .map_err(|_| "Invalid publication restart SDP")?;
+                p.publisher
+                    .rtc
+                    .sdp_api()
+                    .accept_answer(pending, answer)
+                    .map_err(|_| "Publication restart failed")?;
+                p.publisher.answer_expires = None;
+                p.request_keyframe = true;
+            }
             ClientMessage::SubAnswer { sdp } => {
                 validate_sdp(&sdp, false)?;
                 let pending = p.pending.take().ok_or("Unexpected subscription answer")?;
@@ -294,6 +368,7 @@ impl Room {
                     .sdp_api()
                     .accept_answer(pending, answer)
                     .map_err(|_| "Subscription negotiation failed")?;
+                p.subscriber.answer_expires = None;
             }
             ClientMessage::State { mic, cam, deaf } => {
                 p.peer.mic = mic;
@@ -330,6 +405,8 @@ impl Room {
                 if connection.rtc.accepts(&input) {
                     if connection.rtc.handle_input(input).is_err() {
                         p.failed = true;
+                    } else if connection.rtc.is_connected() {
+                        connection.media_expires = Some(now + MEDIA_TIMEOUT);
                     }
                     return;
                 }
@@ -339,7 +416,12 @@ impl Room {
     pub fn timeout(&mut self, now: Instant) {
         self.now = now;
         for p in self.peers.values_mut() {
-            for c in [&mut p.publisher, &mut p.subscriber] {
+            for (leg, c) in [("pub", &mut p.publisher), ("sub", &mut p.subscriber)] {
+                if c.expired(now) || !c.rtc.is_alive() {
+                    tracing::info!(transport = leg, "Media transport closed or timed out");
+                    p.failed = true;
+                    break;
+                }
                 if c.deadline <= now && c.rtc.handle_input(Input::Timeout(now)).is_err() {
                     p.failed = true;
                 }
@@ -404,6 +486,7 @@ impl Room {
                     .copied()
                     .filter(|(source, _)| *source != id)
                     .collect::<Vec<_>>(),
+                self.now,
             );
             p.drain_subscriber(&mut datagrams, &mut requests);
             if p.pending.is_none() && p.subscriber.rtc.is_connected() {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-11-20
+
+- Remove expired signaling and media sessions, including incomplete negotiations. Keep a lone publisher connected without requiring a subscription.
+- Keep the original session when a second participant requests the same name.
+- Restart ICE on either transport. Wait for the page to be visible and online before using the single automatic rejoin attempt. Offer a manual reconnect after failure. Full rejoins release local capture and start muted with camera off.
+- Retire the previous send stream before reassigning its media line to a new participant.
+- Advance the client and server to protocol 3.
+
 ## 0.2.0 - 2026-11-19
 
 - Forward VP8 camera frames alongside Opus without transcoding.

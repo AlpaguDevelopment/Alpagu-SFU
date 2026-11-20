@@ -6,15 +6,15 @@ The project is developed using AI models **GPT-6 Astra, Claude Opus 5.5, and Cla
 
 ## Status
 
-**v0.2.0 is an experimental LAN audio and video release.** It adds VP8 camera forwarding, keyframe requests, and NACK/RTX recovery to the single-room Opus audio path. Up to 16 participants share one UDP media port, with separate publish and subscribe connections.
+**v0.3.0 adds disconnect cleanup and reconnection for trusted LAN calls.** Up to 16 participants can share Opus audio and VP8 video in one room. The server removes disconnected participants and keeps the original session when a second participant tries to join under the same name.
 
-Upgrade the server and test client together: v0.2 uses **protocol 2**, incompatible with v0.1 clients. Authentication, multiple rooms, TURN, signaling TLS in the core, and automatic reconnection are not implemented. Use a trusted local network.
+Upgrade the server and test client together. Both use **protocol 3**. If a media connection drops, the client can restart ICE. If the session closes, the client tries one fresh join when the page is visible and online. Select **Reconnect** if that attempt fails. A fresh join starts with the microphone and camera off.
 
-Mobile browsers may pause camera capture while backgrounded, leaving the last frame visible remotely. Video resumes on return while the connection survives; longer background periods can disconnect the session. Automatic reconnection is planned for v0.3. Rejoin manually after a disconnect.
+Mobile browsers can suspend camera capture in the background. Desktop and phone testing covered recovery after background suspension, network interruptions and a server restart.
 
 ## Run the Windows release
 
-1. Download `Alpagu-SFU-v0.2.0-windows-x64.zip` from [Releases](https://github.com/AlpaguDevelopment/Alpagu-SFU/releases).
+1. Download `Alpagu-SFU-v0.3.0-windows-x64.zip` and `SHA256SUMS.txt` from the [v0.3.0 release](https://github.com/AlpaguDevelopment/Alpagu-SFU/releases/tag/v0.3.0). Compare the checksum with `Get-FileHash .\Alpagu-SFU-v0.3.0-windows-x64.zip -Algorithm SHA256`.
 2. Extract it. Open PowerShell in the extracted directory.
 3. Find your active LAN IPv4 address with `ipconfig`, then run:
 
@@ -33,7 +33,7 @@ Requirements: stable Rust (tested with 1.100.0), and the platform's native build
 ```powershell
 git clone https://github.com/AlpaguDevelopment/Alpagu-SFU.git
 cd Alpagu-SFU
-git switch --detach v0.2.0
+git switch --detach v0.3.0
 cargo run --manifest-path core/Cargo.toml --release --locked -- --ip <LAN-IP>
 ```
 
@@ -57,7 +57,7 @@ npm run dev
 
 - Computer: open `https://localhost:5173`.
 - Phone on the same network: open `https://<LAN-IP>:5173`.
-- Accept the local development certificate warning and grant microphone access. For v0.2, turn on both cameras and grant camera access to test two-way video.
+- Accept the local development certificate warning and grant microphone access. Turn on both cameras and grant camera access to test two-way video.
 - Join with different names and speak in both directions. Use headphones to avoid feedback.
 - If playback is blocked, press **Tap to enable audio**.
 
@@ -86,7 +86,7 @@ npm run dev
 
 See [testing instructions](docs/testing.md) for automated checks, the desktop/phone checklist, and troubleshooting.
 
-- [Protocol v2](docs/protocol.md)
+- [Signaling protocol v3](docs/protocol.md)
 - [Roadmap](docs/roadmap.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)

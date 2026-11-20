@@ -1,8 +1,9 @@
 import './style.css';
 import { LocalCamera } from './local-camera';
+import { scheduleRejoin } from './rejoin';
 import { SfuClient, errText, PROTOCOL, type Kind, type Peer } from './sfu-client';
 
-const TEST_CLIENT_VERSION = '0.2.0';
+const TEST_CLIENT_VERSION = '0.3.0';
 const NAME_KEY = 'sfu-test-name';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -86,6 +87,8 @@ function renderTile(tile: Tile) {
 function removeTile(id: string) {
   const tile = tiles.get(id);
   if (!tile) return;
+  tile.video.srcObject = null;
+  if (tile.audio) tile.audio.srcObject = null;
   tile.audio?.remove();
   tile.el.remove();
   tiles.delete(id);
@@ -94,6 +97,7 @@ function removeTile(id: string) {
 
 function playSafe(el: HTMLMediaElement) {
   el.play().catch((err) => {
+    if (!el.isConnected || !el.srcObject || (err instanceof DOMException && err.name === 'AbortError')) return;
     log('Playback blocked: ' + errText(err));
     if (el instanceof HTMLAudioElement) unlockBtn.hidden = false;
   });
@@ -113,6 +117,11 @@ let cam = false;
 let deaf = false;
 let micBeforeDeaf = false;
 let busy = false;
+let micPending = false;
+let cancelRejoin: (() => void) | undefined;
+let manualReconnect = false;
+let autoRetryAvailable = true;
+let stableTimer: number | undefined;
 
 function selfInfo(): Peer {
   return { id: SELF, name: nameInput.value.trim(), mic, cam, deaf };
@@ -123,7 +132,8 @@ function renderControls() {
   setBtn(btnCam, cam, 'Camera on', 'Camera off');
   if (busy) btnCam.textContent = 'Updating camera…';
   setBtn(btnDeaf, !deaf, 'Deafen', 'Undeafen');
-  btnMic.disabled = deaf || busy;
+  btnMic.disabled = deaf || busy || micPending || !client?.canPublishVideo();
+  btnDeaf.disabled = !client || micPending;
   btnCam.disabled = busy || !client?.canPublishVideo();
   const self = tiles.get(SELF);
   if (self) {
@@ -165,7 +175,12 @@ nameInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') joinBtn.click();
 });
 
-joinBtn.onclick = async () => {
+joinBtn.onclick = () => {
+  autoRetryAvailable = true;
+  void enterRoom(manualReconnect);
+};
+
+async function enterRoom(reconnecting: boolean) {
   const name = nameInput.value.trim();
   if (!name) return showLobbyError('Enter a name.');
   lobbyError.hidden = true;
@@ -176,16 +191,18 @@ joinBtn.onclick = async () => {
   }
   joinBtn.disabled = true;
 
-  try {
-    const s = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
-    micTrack = s.getAudioTracks()[0] ?? null;
-    mic = micTrack !== null;
-  } catch (err) {
-    log('Could not acquire microphone: ' + errText(err));
-    micTrack = null;
-    mic = false;
+  if (!reconnecting) {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      micTrack = s.getAudioTracks()[0] ?? null;
+      mic = micTrack !== null;
+    } catch (err) {
+      log('Could not acquire microphone: ' + errText(err));
+      micTrack = null;
+      mic = false;
+    }
   }
   cam = false;
   deaf = false;
@@ -196,10 +213,14 @@ joinBtn.onclick = async () => {
   tiles.set(SELF, makeTile(selfInfo(), true));
   renderControls();
 
-  client = new SfuClient({
+  let connectedStatus = '';
+  let joined = false;
+  const session = new SfuClient({
     published() { renderControls(); },
     joined(selfId, server, peers) {
-      statusEl.textContent = `Connected · core ${server}`;
+      joined = true;
+      connectedStatus = `Connected · core ${server}`;
+      statusEl.textContent = connectedStatus;
       log(`Joined (id ${selfId}), ${peers.length} other peers`);
       for (const p of peers) tiles.set(p.id, makeTile(p, false));
       client?.sendState({ mic, cam, deaf });
@@ -224,15 +245,34 @@ joinBtn.onclick = async () => {
       attachRemote(peerId, kind, track);
     },
     pcState(pc, state) {
-      if (state === 'failed') statusEl.textContent = `Media connection failed (${pc})`;
+      window.clearTimeout(stableTimer);
+      if (session.mediaConnected()) {
+        statusEl.textContent = connectedStatus;
+        stableTimer = window.setTimeout(() => { autoRetryAvailable = true; }, 15_000);
+      } else if (state === 'disconnected' || state === 'failed') {
+        statusEl.textContent = `Restoring media (${pc})...`;
+      }
     },
-    closed(reason) {
-      backToLobby(reason);
+    closed(reason, retryable) {
+      if (client !== session) return;
+      resetSession();
+      if (joined && retryable && autoRetryAvailable) {
+        autoRetryAvailable = false;
+        statusEl.textContent = 'Connection lost. Waiting to reconnect...';
+        cancelRejoin = scheduleRejoin(() => {
+          cancelRejoin = undefined;
+          log('Rejoining automatically');
+          void enterRoom(true);
+        });
+      } else {
+        backToLobby(reason, retryable || reconnecting);
+      }
     },
     log,
   });
-  client.join(name, micTrack);
-};
+  client = session;
+  session.join(name, micTrack);
+}
 
 function attachRemote(peerId: string, kind: Kind, track: MediaStreamTrack | null) {
   const t = tiles.get(peerId);
@@ -257,37 +297,63 @@ function attachRemote(peerId: string, kind: Kind, track: MediaStreamTrack | null
   renderTile(t);
 }
 
-btnLeave.onclick = () => client?.leave();
+btnLeave.onclick = () => {
+  if (client) client.leave();
+  else backToLobby('Left room', false);
+};
 
-function backToLobby(reason: string) {
+function resetSession() {
+  window.clearTimeout(stableTimer);
   client = null;
   micTrack?.stop();
   localCamera.stop();
   busy = false;
+  micPending = false;
   cameraStatus.textContent = '';
   micTrack = camTrack = null;
   mic = cam = deaf = false;
   for (const id of [...tiles.keys()]) removeTile(id);
   unlockBtn.hidden = true;
+  renderControls();
+}
+
+function backToLobby(reason: string, reconnect: boolean) {
+  cancelRejoin?.();
+  cancelRejoin = undefined;
   room.hidden = true;
   lobby.hidden = false;
+  manualReconnect = reconnect && reason !== 'Left room';
+  joinBtn.textContent = manualReconnect ? 'Reconnect' : 'Join';
   joinBtn.disabled = false;
-  if (reason !== 'Left room') showLobbyError('Connection closed. See the Log panel for details.');
+  if (reason !== 'Left room') showLobbyError(reason);
 }
 
 // ---------- controls ----------
 btnMic.onclick = async () => {
-  if (deaf) return;
+  const session = client;
+  if (deaf || micPending || !session?.canPublishVideo()) return;
   if (!micTrack) {
+    micPending = true;
+    renderControls();
+    let track: MediaStreamTrack | undefined;
     try {
-      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micTrack = s.getAudioTracks()[0];
-      await client?.setMic(micTrack);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      track = stream.getAudioTracks()[0];
+      if (!track || client !== session) return;
+      await session.setMic(track);
+      if (client !== session) return;
+      micTrack = track;
+      mic = true;
     } catch (err) {
-      log('Could not acquire microphone: ' + errText(err));
-      return;
+      log('Could not enable microphone: ' + errText(err));
+    } finally {
+      if (track !== micTrack) track?.stop();
+      if (client === session) {
+        micPending = false;
+        renderControls();
+      }
     }
-    mic = true;
+    if (client !== session) return;
   } else {
     mic = !mic;
     micTrack.enabled = mic; // Disabled tracks send silence without renegotiation.
