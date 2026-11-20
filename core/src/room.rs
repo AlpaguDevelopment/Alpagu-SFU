@@ -10,6 +10,7 @@ use std::{
 };
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
+    bwe::Bitrate,
     change::{SdpAnswer, SdpOffer, SdpPendingOffer},
     media::{Direction, KeyframeRequestKind, MediaData, MediaKind, Mid},
     net::{Protocol, Receive},
@@ -29,24 +30,36 @@ struct Batch {
 }
 
 struct Connection {
+    participant_id: u64,
+    leg: Pc,
     rtc: Rtc,
     deadline: Instant,
     media_expires: Option<Instant>,
     answer_expires: Option<Instant>,
 }
 impl Connection {
-    fn new(address: SocketAddr) -> Result<Self> {
+    fn new(address: SocketAddr, participant_id: u64, leg: Pc) -> Result<Self> {
         let now = Instant::now();
+        // The publishing browser estimates its uplink from our TWCC feedback.
+        // Only the subscription transport needs a server-side send estimator.
+        let send_estimate = matches!(leg, Pc::Sub).then(|| Bitrate::kbps(1200));
         let mut rtc = Rtc::builder()
             .set_ice_lite(true)
             .clear_codecs()
             .enable_opus(true, false)
+            // Opus has no RTX here. Allow modest reordering, then forward the
+            // next intact packet for the listener's jitter buffer and FEC.
+            .set_reordering_timeout_audio(Some(Duration::from_millis(60)))
             .enable_vp8(true)
+            .enable_bwe(send_estimate)
+            .set_stats_interval(Some(Duration::from_secs(5)))
             .set_send_buffer_video(1000)
             .build(now);
         rtc.add_local_candidate(Candidate::host(address, "udp").map_err(|_| "Invalid candidate")?)
             .ok_or("Candidate rejected")?;
         Ok(Self {
+            participant_id,
+            leg,
             rtc,
             deadline: now,
             media_expires: None,
@@ -82,6 +95,23 @@ impl Connection {
                 }
                 Output::Event(Event::MediaData(data)) => batch.frames.push(data),
                 Output::Event(Event::KeyframeRequest(request)) => batch.keyframes.push(request.mid),
+                Output::Event(Event::PeerStats(stats)) if self.rtc.is_connected() => {
+                    let rtt = stats.rtt.or_else(|| {
+                        stats
+                            .selected_candidate_pair
+                            .as_ref()?
+                            .current_round_trip_time
+                    });
+                    tracing::info!(
+                        participant = self.participant_id, leg = ?self.leg,
+                        rx_bytes = stats.peer_bytes_rx, tx_bytes = stats.peer_bytes_tx,
+                        rtt_ms = rtt.map(|v| v.as_millis() as u64),
+                        rx_loss_pct = stats.ingress_loss_fraction.map(|v| v * 100.0),
+                        tx_loss_pct = stats.egress_loss_fraction.map(|v| v * 100.0),
+                        estimated_tx_bps = stats.bwe_tx.map(|v| v.as_u64()),
+                        "Transport quality"
+                    );
+                }
                 _ => {}
             }
         }
@@ -271,8 +301,8 @@ impl Room {
         let mut p = Participant {
             peer: peer.clone(),
             tx,
-            publisher: Connection::new(self.address)?,
-            subscriber: Connection::new(self.address)?,
+            publisher: Connection::new(self.address, id, Pc::Pub)?,
+            subscriber: Connection::new(self.address, id, Pc::Sub)?,
             published: false,
             pub_restart: None,
             restart_sub: false,

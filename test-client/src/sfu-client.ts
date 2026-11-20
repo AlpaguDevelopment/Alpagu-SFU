@@ -61,6 +61,11 @@ export class SfuClient {
 
   canPublishVideo() { return this.publishReady && !this.closedOnce; }
 
+  async transportStats(leg: PcName): Promise<RTCStatsReport | undefined> {
+    const pc = leg === 'pub' ? this.pub : this.sub;
+    if (pc?.connectionState === 'connected') return pc.getStats();
+  }
+
   join(name: string, micTrack: MediaStreamTrack | null) {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -116,10 +121,11 @@ export class SfuClient {
       const p = this.videoSender.getParameters();
       if (p.encodings?.length) {
         p.encodings[0].maxBitrate = VIDEO_MAX_BITRATE;
+        p.degradationPreference = 'maintain-framerate';
         await this.videoSender.setParameters(p);
       }
     } catch (err) {
-      this.ev.log('Could not set bitrate limit: ' + errText(err));
+      this.ev.log('Could not configure video encoding: ' + errText(err));
     }
   }
 
@@ -178,7 +184,9 @@ export class SfuClient {
   private async startPublish(micTrack: MediaStreamTrack | null) {
     const pc = this.makePc('pub');
     this.pub = pc;
-    this.audioSender = pc.addTransceiver('audio', { direction: 'sendonly' }).sender;
+    this.audioSender = pc.addTransceiver('audio', {
+      direction: 'sendonly', sendEncodings: [{ priority: 'high' }],
+    }).sender;
     this.videoSender = pc.addTransceiver('video', { direction: 'sendonly' }).sender;
     if (micTrack) await this.audioSender.replaceTrack(micTrack);
     const offer = await pc.createOffer();

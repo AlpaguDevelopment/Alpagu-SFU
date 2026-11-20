@@ -1,9 +1,10 @@
 import './style.css';
 import { LocalCamera } from './local-camera';
+import { monitorQuality } from './quality';
 import { scheduleRejoin } from './rejoin';
 import { SfuClient, errText, PROTOCOL, type Kind, type Peer } from './sfu-client';
 
-const TEST_CLIENT_VERSION = '0.3.0';
+const TEST_CLIENT_VERSION = '0.4.0';
 const NAME_KEY = 'sfu-test-name';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -122,6 +123,8 @@ let cancelRejoin: (() => void) | undefined;
 let manualReconnect = false;
 let autoRetryAvailable = true;
 let stableTimer: number | undefined;
+let stopQuality: (() => void) | undefined;
+const metric = (value?: number, digits = 0) => value?.toFixed(digits) ?? '—';
 
 function selfInfo(): Peer {
   return { id: SELF, name: nameInput.value.trim(), mic, cam, deaf };
@@ -220,6 +223,10 @@ async function enterRoom(reconnecting: boolean) {
     joined(selfId, server, peers) {
       joined = true;
       connectedStatus = `Connected · core ${server}`;
+      stopQuality = monitorQuality((leg) => session.transportStats(leg), (up, down) => {
+        $('upload-quality').textContent = `Send ${metric(up.bitrateKbps)} kbps · RTT ${metric(up.rttMs)} ms · peak stream loss ${metric(up.lossPct, 1)}% · estimated capacity ${metric(up.availableKbps)} kbps`;
+        $('download-quality').textContent = `Receive ${metric(down.bitrateKbps)} kbps · RTT ${metric(down.rttMs)} ms · loss ${metric(down.lossPct, 1)}%`;
+      });
       statusEl.textContent = connectedStatus;
       log(`Joined (id ${selfId}), ${peers.length} other peers`);
       for (const p of peers) tiles.set(p.id, makeTile(p, false));
@@ -303,6 +310,10 @@ btnLeave.onclick = () => {
 };
 
 function resetSession() {
+  stopQuality?.();
+  stopQuality = undefined;
+  $('upload-quality').textContent = '';
+  $('download-quality').textContent = '';
   window.clearTimeout(stableTimer);
   client = null;
   micTrack?.stop();

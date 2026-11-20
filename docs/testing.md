@@ -21,7 +21,7 @@ Recovery tests cover duplicate names, missing negotiation or transport traffic, 
 
 ## Manual acceptance and regression checklist
 
-1. **Two participants, once:** join from desktop and phone with different names. Confirm two tiles and core version `0.3.0`. Speak in each direction for at least 20 seconds. Press **Tap to enable audio** if shown.
+1. **Two participants, once:** join from desktop and phone with different names. Confirm two tiles and that the core and test-client versions match the build under test. Speak in each direction for at least 20 seconds. Press **Tap to enable audio** if shown.
 2. **Microphone, five cycles on each device:** turn it off and on. Off must stop transmitted voice and show **Mic off** remotely; on must restore voice.
 3. **Deafen, five cycles:** remote audio and the local microphone must both stop; the remote tile must show **Deafened**. Undeafen restores audio and the previous microphone state. Also try once with the microphone already off; it must stay off afterward.
 4. **Three participants, once:** add a second desktop tab under a third name. All three tiles must appear. Speak from each participant and check the others receive audio. Mute unused tabs sharing the same physical microphone.
@@ -31,6 +31,15 @@ Recovery tests cover duplicate names, missing negotiation or transport traffic, 
 8. **Late viewer and replacement:** with camera already active, join from a third tab and confirm video appears. Then repeat step 5 with cameras enabled and distinct names; old video must not appear under a replacement participant's name.
 9. **Phone background, five cycles:** background the browser for five seconds, then return. With the connection still alive, moving video must return in both directions. If disconnected, verify recovery as described below.
 10. **Camera cleanup, once per device:** leave with camera open; its usage indicator must turn off. Deny camera permission once, then allow and retry. If a permission prompt is available, leave before granting permission, then grant it: capture must not remain active.
+
+## v0.4 network quality (development)
+
+1. Run the development core and client, join from desktop and phone, and open **Network quality** on both. Turn on both cameras. Speak and move for 30 seconds. Record send/receive kbps, round-trip time (RTT), estimated upload capacity and packet loss on each device. Send loss shows the largest recent loss fraction reported by the SFU for an active outgoing stream. Receive loss combines the incoming streams over the sampling interval. A dash means there is no measurement yet.
+2. With a packet shaper restricted to the phone's media UDP traffic on port 7882, introduce 100 ms of delay in each direction (200 ms added round trip) and 5% packet loss. Speak a sentence in each direction and keep moving for 30 seconds. Check whether the listener can repeat it and see motion. Remove the impairment and allow 60 seconds for recovery. Repeat with 15% loss. Run each profile twice.
+3. Check whether the sender reduces its video rate under impairment and whether rate and picture recover with the link. Use comparable motion throughout. Record any freeze and its duration. The server logs `Transport quality` every five seconds per connected leg with the participant ID, cumulative transport bytes and available feedback.
+4. Run the media and recovery regression checklists. For failures, include the profile, affected direction, both quality readings, browser **Log** and core output from the same time.
+
+The publisher uses negotiated transport-wide congestion feedback and requests high priority for audio. The VP8 sender prefers to preserve frame rate. Opus advertises in-band FEC and the browser decides when to encode redundant information. After an audio packet is lost, the SFU waits up to 60 ms to reorder subsequent packets. The baseline keeps RED disabled so its additional bandwidth and audio benefit can be compared separately.
 
 ## v0.3 recovery acceptance
 

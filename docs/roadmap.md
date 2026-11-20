@@ -2,7 +2,7 @@
 
 Build a small working media path first, then improve reliability, control, coverage, and measurement. Each milestone must pass automated checks and desktop/phone regression tests before the next begins. These are planned capabilities, not promises or current features.
 
-**v0.3.0** adds disconnect cleanup and reconnection. Automated checks and desktop/phone acceptance passed. Mobile browsers can still suspend capture in the background. The next milestone is v0.4 network quality.
+**v0.3.0** adds disconnect cleanup and reconnection. Automated checks and desktop/phone acceptance passed. Mobile browsers can still suspend capture in the background. Development of v0.4 network quality is underway. Its [loss and delay checklist](testing.md#v04-network-quality-development) covers desktop and phone acceptance.
 
 | Version | Milestone | Acceptance focus |
 |---|---|---|

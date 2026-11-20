@@ -70,6 +70,26 @@ struct Client {
     mapping: Vec<Value>,
     max_media_lines: usize,
 }
+
+#[test]
+fn publish_answer_negotiates_transport_feedback_and_opus_fec() {
+    let mut room = test_room();
+    let mut client = Client::new(&mut room, 1, Instant::now());
+    let answer = std::iter::from_fn(|| client.rx.try_recv().ok())
+        .find(|m| m["type"] == "pub_answer")
+        .unwrap();
+    let sdp = answer["sdp"].as_str().unwrap();
+    for section in sdp.split("\nm=").skip(1) {
+        assert!(section.contains("transport-wide-cc"));
+        assert!(
+            section
+                .lines()
+                .any(|s| s.starts_with("a=rtcp-fb:") && s.ends_with(" transport-cc"))
+        );
+    }
+    assert!(sdp.contains("useinbandfec=1"));
+    assert!(!sdp.contains(" red/48000"));
+}
 impl Client {
     fn new(room: &mut Room, id: u64, now: Instant) -> Self {
         let rx = join(room, id);
@@ -368,6 +388,56 @@ fn advance_network(
             exchange_network(room, clients, *now, network);
         }
     }
+}
+
+#[test]
+fn isolated_uplink_audio_loss_releases_following_speech_within_120_ms() {
+    let (mut room, mut clients, mut now) = video_room();
+    let audio_mid = clients[1]
+        .mapping
+        .iter()
+        .find(|t| t["peer"] == "1" && t["kind"] == "audio")
+        .unwrap()["mid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mid = clients[0].mid;
+    let pt = clients[0]
+        .publisher
+        .writer(mid)
+        .unwrap()
+        .payload_params()
+        .find(|p| p.spec().codec == str0m::format::Codec::Opus)
+        .unwrap()
+        .pt();
+    clients[0].write_audio(now, 1);
+    exchange(&mut room, &mut clients, now);
+    advance(&mut room, &mut clients, &mut now, 5, false);
+    assert!(
+        clients[1]
+            .received
+            .iter()
+            .any(|(mid, _)| mid.to_string() == audio_mid)
+    );
+    clients[1].received.clear();
+    let mut net = Network {
+        loss: Some((clients[0].pub_addr, room.address, *pt, 0)),
+        ..Default::default()
+    };
+    for tick in 2..=8 {
+        clients[0].write_audio(now, tick);
+        exchange_network(&mut room, &mut clients, now, &mut net);
+        if tick < 8 {
+            advance_network(&mut room, &mut clients, &mut now, 1, false, &mut net);
+        }
+    }
+    assert!(net.dropped);
+    assert!(
+        clients[1]
+            .received
+            .iter()
+            .any(|(mid, _)| mid.to_string() == audio_mid)
+    );
 }
 
 #[test]
