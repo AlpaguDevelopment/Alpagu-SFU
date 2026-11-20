@@ -230,7 +230,7 @@ mod socket_tests {
         let (tx, mut rx) = mpsc::channel(128);
         let slots = Arc::new(Semaphore::new(32));
         let server = tokio::spawn(async move {
-            let mut room = crate::room::Room::new("127.0.0.1:7882".parse().unwrap());
+            let mut room = crate::room::Room::new("127.0.0.1:7882".parse().unwrap(), None);
             let mut id = 0;
             loop {
                 tokio::select! {

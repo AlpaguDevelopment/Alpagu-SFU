@@ -127,6 +127,7 @@ struct Slot {
 }
 struct Participant {
     peer: Peer,
+    moderator: bool,
     tx: mpsc::Sender<Value>,
     publisher: Connection,
     subscriber: Connection,
@@ -246,12 +247,14 @@ impl Participant {
 
 pub struct Room {
     peers: BTreeMap<u64, Participant>,
+    moderator_key: Option<String>,
     address: SocketAddr,
     now: Instant,
 }
 impl Room {
-    pub fn new(address: SocketAddr) -> Self {
+    pub fn new(address: SocketAddr, moderator_key: Option<String>) -> Self {
         Self {
+            moderator_key,
             peers: BTreeMap::new(),
             address,
             now: Instant::now(),
@@ -297,9 +300,11 @@ impl Room {
             mic: false,
             cam: false,
             deaf: false,
+            server_muted: false,
         };
         let mut p = Participant {
             peer: peer.clone(),
+            moderator: false,
             tx,
             publisher: Connection::new(self.address, id, Pc::Pub)?,
             subscriber: Connection::new(self.address, id, Pc::Sub)?,
@@ -409,6 +414,33 @@ impl Room {
                 p.peer.deaf = deaf;
                 self.broadcast(id, json!({"type":"peer_state", "id":id.to_string(), "mic":mic, "cam":cam, "deaf":deaf}));
             }
+            ClientMessage::ClaimModerator { key } => {
+                if self.moderator_key.as_ref() != Some(&key) {
+                    return Err("Moderator access denied");
+                }
+                p.moderator = true;
+                p.send(json!({"type":"moderator_granted"}));
+            }
+            ClientMessage::SetServerMute { id: target, muted } => {
+                if !p.moderator {
+                    return Err("Moderator access required");
+                }
+                let target_id = target
+                    .parse::<u64>()
+                    .map_err(|_| "Invalid participant ID")?;
+                let Some(target_peer) = self.peers.get_mut(&target_id) else {
+                    if let Some(actor) = self.peers.get_mut(&id) {
+                        actor.send(
+                            json!({"type":"error","message":"Participant has left","fatal":false}),
+                        );
+                    }
+                    return Ok(());
+                };
+                target_peer.peer.server_muted = muted;
+                let notice = json!({"type":"server_mute","id":target_peer.peer.id,"muted":muted});
+                target_peer.send(notice.clone());
+                self.broadcast(target_id, notice);
+            }
             ClientMessage::Ping {} => p.send(json!({"type":"pong"})),
             ClientMessage::Ice {
                 pc,
@@ -480,6 +512,9 @@ impl Room {
                             continue;
                         };
                         // Bound the size of frames retained during fanout.
+                        if kind == MediaKind::Audio && (p.peer.server_muted || p.peer.deaf) {
+                            continue;
+                        }
                         if data.data.len() <= 512 * 1024 {
                             frames.push((id, kind, data));
                         } else if kind == MediaKind::Video {
@@ -535,6 +570,9 @@ impl Room {
             }
             for p in self.peers.values_mut() {
                 if p.pending.is_some() || p.failed || !p.subscriber.rtc.is_connected() {
+                    continue;
+                }
+                if kind == MediaKind::Audio && p.peer.deaf {
                     continue;
                 }
                 let Some(slot) = p

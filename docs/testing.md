@@ -32,6 +32,13 @@ Recovery tests cover duplicate names, missing negotiation or transport traffic, 
 9. **Phone background, five cycles:** background the browser for five seconds, then return. With the connection still alive, moving video must return in both directions. If disconnected, verify recovery as described below.
 10. **Camera cleanup, once per device:** leave with camera open; its usage indicator must turn off. Deny camera permission once, then allow and retry. If a permission prompt is available, leave before granting permission, then grant it: capture must not remain active.
 
+## v0.5 audio moderation (development)
+
+1. Before starting the development core, set the optional test moderator key in its PowerShell window with `$env:SFU_MODERATOR_KEY = Read-Host -MaskInput 'Test moderator key'` (PowerShell 7.1+, 16–128 UTF-8 bytes). Join from desktop and phone. Check core/client 0.5.0 and protocol 4.
+2. On desktop open **Moderator controls**, enter the key and select **Unlock controls**. Select **Server mute** on the phone's tile. Speak into the phone, toggle its mic twice, and keep the camera moving. Both participants should see **Server muted**. The desktop should receive video and hear silence after buffered audio finishes. **Lift mute** should restore speech if the phone mic is on.
+3. Turn both cameras off and speak continuously from desktop. On the phone switch **Deafen** on and off twice. After the playback buffer drains, expect incoming audio to stop and the receive bitrate to fall. Undeafening should restore incoming speech. Repeat once while the moderator keeps the phone muted. Its outgoing speech must stay blocked after undeafening.
+4. Join a third tab while the phone is muted. The new tab should see the mute badge and receive no speech from the phone. Leave and rejoin as the moderator once. The new session must unlock moderator access again. For failures, record the step, both client logs and matching core output. Omit the moderator key.
+
 ## v0.4 network quality (development)
 
 1. Run the development core and client, join from desktop and phone, and open **Network quality** on both. Turn on both cameras. Speak and move for 30 seconds. Record send/receive kbps, round-trip time (RTT), estimated upload capacity and packet loss on each device. Send loss shows the largest recent loss fraction reported by the SFU for an active outgoing stream. Receive loss combines the incoming streams over the sampling interval. A dash means there is no measurement yet.

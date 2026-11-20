@@ -1,12 +1,14 @@
 // Signaling and two PeerConnections (pub/sub). Contract: ../../docs/protocol.md
-export const PROTOCOL = 3;
+export const PROTOCOL = 4;
 
-export type Peer = { id: string; name: string; mic: boolean; cam: boolean; deaf: boolean };
+export type Peer = { id: string; name: string; mic: boolean; cam: boolean; deaf: boolean; serverMuted: boolean };
 export type Kind = 'audio' | 'video';
 type Track = { mid: string; peer: string; kind: Kind };
 type PcName = 'pub' | 'sub';
 
 type ServerMsg =
+  | { type: 'moderator_granted' }
+  | { type: 'server_mute'; id: string; muted: boolean }
   | { type: 'joined'; id: string; protocol: number; server: string; peers: Peer[] }
   | { type: 'peer_joined'; peer: Peer }
   | { type: 'peer_left'; id: string }
@@ -19,6 +21,8 @@ type ServerMsg =
   | { type: 'error'; message: string; fatal: boolean };
 
 export type Events = {
+  moderatorGranted(): void;
+  serverMute(id: string, muted: boolean): void;
   published(): void;
   joined(selfId: string, server: string, peers: Peer[]): void;
   peerJoined(peer: Peer): void;
@@ -109,6 +113,9 @@ export class SfuClient {
     this.send({ type: 'state', ...s });
   }
 
+  claimModerator(key: string) { this.send({ type: 'claim_moderator', key }); }
+  setServerMute(id: string, muted: boolean) { this.send({ type: 'set_server_mute', id, muted }); }
+
   async setMic(track: MediaStreamTrack | null) {
     await this.audioSender?.replaceTrack(track);
   }
@@ -131,6 +138,10 @@ export class SfuClient {
 
   private async handle(msg: ServerMsg, micTrack: MediaStreamTrack | null) {
     switch (msg.type) {
+      case 'moderator_granted':
+        return this.ev.moderatorGranted();
+      case 'server_mute':
+        return this.ev.serverMute(msg.id, msg.muted);
       case 'joined':
         window.clearTimeout(this.joinTimer);
         if (msg.protocol !== PROTOCOL) {

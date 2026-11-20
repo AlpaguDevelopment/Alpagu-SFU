@@ -1,4 +1,4 @@
-# Signaling protocol v3
+# Signaling protocol v4
 
 This document describes the current contract between `core` and `test-client`. Version changes to the wire contract must update both implementations and the protocol version.
 
@@ -19,13 +19,15 @@ v0.3 forwards encoded Opus and VP8 without transcoding. Video subscriptions wait
 
 | Type | Fields | Meaning |
 |---|---|---|
-| `join` | `name: string`, `protocol: 3` | Required first message; name has 1-32 Unicode characters, is not whitespace-only, and contains no control characters |
+| `join` | `name: string`, `protocol: 4` | Required first message; name has 1-32 Unicode characters, is not whitespace-only, and contains no control characters |
 | `pub_offer` | `sdp: string` | One initial publication offer per connection |
 | `restart_ice` | `pc: "pub" or "sub"` | Request an ICE restart for an existing transport. The server offers and keeps its local candidate. Subscription changes and restarts share the same offer queue. |
 | `pub_restart_answer` | `sdp: string` | Answer to the outstanding publication ICE restart offer |
 | `sub_answer` | `sdp: string` | Answer to the outstanding subscription offer |
 | `ice` | `pc: "pub" or "sub"`, `candidate: string`, `sdpMid: string or null`, `sdpMLineIndex: number or null` | Optional; currently ignored by the server |
-| `state` | `mic: boolean`, `cam: boolean`, `deaf: boolean` | Display state; not server-enforced permissions |
+| `state` | `mic: boolean`, `cam: boolean`, `deaf: boolean` | Local capture indicators and self-deafen request |
+| `claim_moderator` | `key: string` | Obtain session-scoped test moderator access using the operator's configured key. An invalid or unconfigured key closes the requesting connection. |
+| `set_server_mute` | `id: string`, `muted: boolean` | A moderator sets or clears the target session's audio publication restriction. An unauthorized request closes the requesting connection. A departed target produces a nonfatal error. |
 | `leave` | none | Leave, then close the socket; socket closure also removes the participant |
 | `ping` | none | Application heartbeat; test client probes every four seconds |
 
@@ -33,10 +35,12 @@ v0.3 forwards encoded Opus and VP8 without transcoding. Video subscriptions wait
 
 | Type | Fields | Meaning |
 |---|---|---|
-| `joined` | `id: string`, `protocol: 3`, `server: string`, `peers: Peer[]` | Core version and existing peers, excluding self |
+| `joined` | `id: string`, `protocol: 4`, `server: string`, `peers: Peer[]` | Core version and existing peers, excluding self. New sessions begin with moderator access and server mute both off. |
 | `peer_joined` | `peer: Peer` | Another participant joined |
 | `peer_left` | `id: string` | Participant removed |
 | `peer_state` | `id: string`, `mic`, `cam`, `deaf` | Updated boolean state fields |
+| `moderator_granted` | none | Moderator access granted to the requesting session |
+| `server_mute` | `id: string`, `muted: boolean` | Authoritative mute state sent to every participant, including the target |
 | `pub_restart_offer` | `sdp: string` | Server offer for ICE restart on the existing publication |
 | `pub_answer` | `sdp: string` | Publication answer |
 | `sub_offer` | `sdp: string`, `tracks: Track[]` | Complete current track mapping, not a delta |
@@ -45,7 +49,7 @@ v0.3 forwards encoded Opus and VP8 without transcoding. Video subscriptions wait
 | `error` | `message: string`, `fatal: boolean` | Fatal errors are followed by socket closure |
 
 ```typescript
-type Peer = { id: string; name: string; mic: boolean; cam: boolean; deaf: boolean };
+type Peer = { id: string; name: string; mic: boolean; cam: boolean; deaf: boolean; serverMuted: boolean };
 type Track = { mid: string; peer: string; kind: 'audio' | 'video' };
 ```
 
@@ -65,7 +69,9 @@ WebSocket messages and frames are limited to 64 KiB. Forwarded media frames are 
 
 Publication SDP allows one audio line and at most one video line. Subscription answers allow up to 15 audio and 15 video lines (30 total), including inactive lines. SDP is limited to 1024 lines. The initial publication layout stays fixed across ICE restarts.
 
-Deafen is client-side: mute remote audio and disable the microphone; restore its previous state when undeafening. `state.deaf` is informational. `state.cam` reports whether local camera publication is enabled; it is not an authorization control. Closing the WebSocket removes the participant immediately.
+After the room processes a server mute, it discards new audio from that publisher before fanout, including when the publisher reports `mic: true`. After a self-deafen request it also skips new audio to and from that participant. Audio already sent can finish playing. Video and other participants' audio continue. Undeafening resumes eligible audio and retains any server mute. The client also mutes playback locally while deafened. Only a moderator can lift a server mute on a live session. The test role and mute expire on leave. A fresh join creates a new identity.
+
+The operator sets the optional `SFU_MODERATOR_KEY` environment variable before starting the core (16–128 UTF-8 bytes). Moderator access is disabled by default. The test client submits the key over the existing signaling connection. Use the HTTPS test client on the trusted test LAN.
 
 ## Disconnect and recovery
 

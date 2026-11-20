@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 pub const MAX_MESSAGE: usize = 64 * 1024;
 pub const MAX_PEERS: usize = 16;
 
@@ -36,6 +36,13 @@ pub enum ClientMessage {
         cam: bool,
         deaf: bool,
     },
+    ClaimModerator {
+        key: String,
+    },
+    SetServerMute {
+        id: String,
+        muted: bool,
+    },
     Leave {},
     Ping {},
 }
@@ -54,6 +61,8 @@ pub struct Peer {
     pub mic: bool,
     pub cam: bool,
     pub deaf: bool,
+    #[serde(rename = "serverMuted")]
+    pub server_muted: bool,
 }
 
 pub fn parse(text: &str) -> Result<ClientMessage, &'static str> {

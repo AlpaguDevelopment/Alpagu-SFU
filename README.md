@@ -8,9 +8,11 @@ The project is developed using AI models **GPT-6 Astra, Claude Opus 5.5, and Cla
 
 **v0.3.0 adds disconnect cleanup and reconnection for trusted LAN calls.** Up to 16 participants can share Opus audio and VP8 video in one room. The server removes disconnected participants and keeps the original session when a second participant tries to join under the same name.
 
-Upgrade the server and test client together. Both use **protocol 3**. If a media connection drops, the client can restart ICE. If the session closes, the client tries one fresh join when the page is visible and online. Select **Reconnect** if that attempt fails. A fresh join starts with the microphone and camera off.
+Upgrade the server and test client together. The v0.3.0 release uses **protocol 3**. If a media connection drops, the client can restart ICE. If the session closes, the client tries one fresh join when the page is visible and online. Select **Reconnect** if that attempt fails. A fresh join starts with the microphone and camera off.
 
 Mobile browsers can suspend camera capture in the background. Desktop and phone testing covered recovery after background suspension, network interruptions and a server restart.
+
+The v0.5.0 development build uses **protocol 4** and adds server-enforced audio mute and deafen. The [moderation test](docs/testing.md#v05-audio-moderation-development) describes how to enable the test moderator controls.
 
 ## Run the Windows release
 
@@ -86,7 +88,7 @@ npm run dev
 
 See [testing instructions](docs/testing.md) for automated checks, the desktop/phone checklist, and troubleshooting.
 
-- [Signaling protocol v3](docs/protocol.md)
+- [Development signaling protocol](docs/protocol.md)
 - [Roadmap](docs/roadmap.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)

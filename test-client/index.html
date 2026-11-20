@@ -34,6 +34,14 @@
         <button id="btn-leave" class="ctrl danger">Leave</button>
       </nav>
       <p id="camera-status" class="muted small" role="status"></p>
+      <details id="moderation" hidden>
+        <summary>Moderator controls</summary>
+        <form id="moderator-login">
+          <label>Moderator key <input id="moderator-key" type="password" maxlength="128" required autocomplete="off" /></label>
+          <button>Unlock controls</button>
+        </form>
+        <span id="moderator-status" hidden>Moderator access active</span>
+      </details>
       <details class="muted small">
         <summary>Network quality</summary>
         <div id="upload-quality"></div>

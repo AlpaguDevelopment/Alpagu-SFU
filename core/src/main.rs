@@ -27,7 +27,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let udp = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, config.advertised.port())).await?;
     let (tx, mut rx) = mpsc::channel(128);
     let slots = Arc::new(Semaphore::new(32));
-    let mut room = room::Room::new(config.advertised);
+    let moderator_key = match std::env::var("SFU_MODERATOR_KEY") {
+        Ok(key) if (16..=128).contains(&key.len()) => Some(key),
+        Err(std::env::VarError::NotPresent) => None,
+        _ => return Err("SFU_MODERATOR_KEY must contain 16 to 128 UTF-8 bytes".into()),
+    };
+    let mut room = room::Room::new(config.advertised, moderator_key);
     let mut next_id = 0u64;
     let mut buffer = vec![0u8; 65536];
     tracing::info!(

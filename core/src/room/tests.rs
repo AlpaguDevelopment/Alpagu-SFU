@@ -8,7 +8,7 @@ fn crypto() {
 }
 fn test_room() -> Room {
     crypto();
-    Room::new("192.0.2.1:7882".parse().unwrap())
+    Room::new("192.0.2.1:7882".parse().unwrap(), None)
 }
 fn join(room: &mut Room, id: u64) -> mpsc::Receiver<Value> {
     let (tx, rx) = mpsc::channel(128);
@@ -200,19 +200,22 @@ impl Client {
         }
     }
     fn write_audio(&mut self, now: Instant, tick: u64) {
+        // A valid Opus comfort-noise frame; forwarding must preserve its encoded bytes.
+        self.write_audio_payload(now, tick, vec![0xf8, 0xff, 0xfe]);
+    }
+    fn write_audio_payload(&mut self, now: Instant, tick: u64, payload: Vec<u8>) {
         let writer = self.publisher.writer(self.mid).unwrap();
         let pt = writer
             .payload_params()
             .find(|p| p.spec().codec == str0m::format::Codec::Opus)
             .unwrap()
             .pt();
-        // A valid Opus comfort-noise frame; forwarding must preserve its encoded bytes.
         writer
             .write(
                 pt,
                 now,
                 MediaTime::from(Duration::from_millis(tick * 20)),
-                vec![0xf8, 0xff, 0xfe],
+                payload,
             )
             .unwrap();
     }
@@ -527,6 +530,113 @@ fn video_room() -> (Room, Vec<Client>, Instant) {
     exchange(&mut room, &mut clients, now);
     advance(&mut room, &mut clients, &mut now, 40, false);
     (room, clients, now)
+}
+
+#[test]
+fn mute_and_deafen_gate_real_audio_independently_of_local_capture() {
+    let (mut room, mut clients, mut now) = video_room();
+    let key = "local-moderator-fixture";
+    room.moderator_key = Some(key.into());
+    room.message(1, ClientMessage::ClaimModerator { key: key.into() })
+        .unwrap();
+    let mute = |muted| ClientMessage::SetServerMute {
+        id: "2".into(),
+        muted,
+    };
+    let state = |deaf| ClientMessage::State {
+        mic: true,
+        cam: true,
+        deaf,
+    };
+
+    // The publisher keeps sending Opus throughout all policy transitions.
+    let policies = [
+        (true, false),
+        (true, true),
+        (true, false),
+        (false, true),
+        (false, false),
+    ];
+    for (phase, &(server_muted, deaf)) in policies.iter().enumerate() {
+        room.message(1, mute(server_muted)).unwrap();
+        room.message(2, state(deaf)).unwrap();
+        for c in &mut clients {
+            c.received.clear();
+        }
+        // Identify when a frame was generated even if a previous packet was in flight.
+        for tick in 0..25 {
+            advance(&mut room, &mut clients, &mut now, 1, false);
+            for c in &mut clients {
+                c.write_audio_payload(
+                    now,
+                    (phase * 25 + tick) as u64,
+                    vec![0xf8, 0xff, phase as u8],
+                );
+            }
+            if tick % 2 == 0 {
+                clients[1].write_video(now, tick == 0);
+            }
+            exchange(&mut room, &mut clients, now);
+        }
+        advance(&mut room, &mut clients, &mut now, 40, false);
+        for viewer in &clients {
+            for track in viewer.mapping.iter().filter(|t| t["kind"] == "audio") {
+                let from_target = track["peer"] == "2";
+                let mut received = false;
+                for (_, data) in viewer
+                    .received
+                    .iter()
+                    .filter(|(mid, _)| mid.to_string() == track["mid"].as_str().unwrap())
+                {
+                    let sent_phase = usize::from(data[2]);
+                    let (muted_at_send, deaf_at_send) = policies[sent_phase];
+                    assert!(
+                        !(from_target && muted_at_send
+                            || (viewer.id == 2 || from_target) && deaf_at_send)
+                    );
+                    received |= sent_phase == phase;
+                }
+                assert_eq!(
+                    received,
+                    !(from_target && server_muted || (viewer.id == 2 || from_target) && deaf),
+                    "viewer {} track {track} mute {server_muted} deaf {deaf}",
+                    viewer.id
+                );
+            }
+        }
+        assert!(
+            clients[0]
+                .received
+                .iter()
+                .any(|(_, frame)| frame.len() == 3000)
+        );
+    }
+}
+
+#[test]
+fn moderator_access_is_opt_in_and_bound_to_one_join() {
+    let mut room = test_room();
+    let _actor = join(&mut room, 1);
+    let _target = join(&mut room, 2);
+    let key = "local-moderator-fixture";
+    let claim = |value: &str| ClientMessage::ClaimModerator { key: value.into() };
+    let mute = || ClientMessage::SetServerMute {
+        id: "2".into(),
+        muted: true,
+    };
+    assert!(room.message(1, claim(key)).is_err());
+    room.moderator_key = Some(key.into());
+    assert!(room.message(1, claim("incorrect")).is_err());
+    assert!(room.message(1, mute()).is_err());
+    assert!(!room.peers[&2].peer.server_muted);
+    room.message(1, claim(key)).unwrap();
+    room.message(1, mute()).unwrap();
+    let mut observer = join(&mut room, 3);
+    let snapshot = observer.try_recv().unwrap();
+    assert_eq!(snapshot["peers"][1]["serverMuted"], true);
+    room.remove(1);
+    let _new_actor = join(&mut room, 4);
+    assert!(room.message(4, mute()).is_err());
 }
 
 #[test]

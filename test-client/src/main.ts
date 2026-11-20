@@ -4,7 +4,7 @@ import { monitorQuality } from './quality';
 import { scheduleRejoin } from './rejoin';
 import { SfuClient, errText, PROTOCOL, type Kind, type Peer } from './sfu-client';
 
-const TEST_CLIENT_VERSION = '0.4.0';
+const TEST_CLIENT_VERSION = '0.5.0';
 const NAME_KEY = 'sfu-test-name';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -24,6 +24,10 @@ const btnDeaf = $<HTMLButtonElement>('btn-deaf');
 const btnLeave = $<HTMLButtonElement>('btn-leave');
 const cameraStatus = $('camera-status');
 const localCamera = new LocalCamera();
+const moderatorLogin = $<HTMLFormElement>('moderator-login');
+const moderatorKey = $<HTMLInputElement>('moderator-key');
+let moderator = false;
+let selfServerMuted = false;
 
 $('versions').textContent = `test-client ${TEST_CLIENT_VERSION} · protocol ${PROTOCOL}`;
 
@@ -45,6 +49,7 @@ type Tile = {
   audio: HTMLAudioElement | null;
   avatar: HTMLElement;
   badges: HTMLElement;
+  muteButton: HTMLButtonElement;
   videoTrack: MediaStreamTrack | null;
 };
 const tiles = new Map<string, Tile>();
@@ -65,10 +70,12 @@ function makeTile(info: Peer, isSelf: boolean): Tile {
   nameEl.textContent = info.name + (isSelf ? ' (you)' : '');
   const badges = document.createElement('span');
   badges.className = 'badges';
-  label.append(nameEl, badges);
+  const muteButton = document.createElement('button');
+  muteButton.onclick = () => client?.setServerMute(info.id, !tile.info.serverMuted);
+  label.append(nameEl, badges, muteButton);
   el.append(video, avatar, label);
   grid.append(el);
-  const tile: Tile = { info, el, video, audio: null, avatar, badges, videoTrack: null };
+  const tile: Tile = { info, el, video, audio: null, avatar, badges, muteButton, videoTrack: null };
   renderTile(tile);
   return tile;
 }
@@ -81,6 +88,10 @@ function renderTile(tile: Tile) {
   const b: string[] = [];
   if (!info.mic) b.push('Mic off');
   if (info.deaf) b.push('Deafened');
+  if (info.serverMuted) b.push('Server muted');
+  tile.muteButton.hidden = !moderator || info.id === SELF;
+  tile.muteButton.textContent = info.serverMuted ? 'Lift mute' : 'Server mute';
+  tile.muteButton.setAttribute('aria-label', `${tile.muteButton.textContent} · ${info.name}`);
   tile.badges.textContent = b.join(' · ');
   countEl.textContent = `${tiles.size} participants`;
 }
@@ -127,7 +138,7 @@ let stopQuality: (() => void) | undefined;
 const metric = (value?: number, digits = 0) => value?.toFixed(digits) ?? '—';
 
 function selfInfo(): Peer {
-  return { id: SELF, name: nameInput.value.trim(), mic, cam, deaf };
+  return { id: SELF, name: nameInput.value.trim(), mic, cam, deaf, serverMuted: selfServerMuted };
 }
 
 function renderControls() {
@@ -218,10 +229,24 @@ async function enterRoom(reconnecting: boolean) {
 
   let connectedStatus = '';
   let joined = false;
+  let sessionId = '';
   const session = new SfuClient({
+    moderatorGranted() {
+      moderator = true;
+      moderatorLogin.hidden = true;
+      $('moderator-status').hidden = false;
+      for (const tile of tiles.values()) renderTile(tile);
+    },
+    serverMute(id, muted) {
+      if (id === sessionId) selfServerMuted = muted;
+      const tile = tiles.get(id === sessionId ? SELF : id);
+      if (tile) { tile.info.serverMuted = muted; renderTile(tile); }
+    },
     published() { renderControls(); },
     joined(selfId, server, peers) {
       joined = true;
+      sessionId = selfId;
+      $('moderation').hidden = false;
       connectedStatus = `Connected · core ${server}`;
       stopQuality = monitorQuality((leg) => session.transportStats(leg), (up, down) => {
         $('upload-quality').textContent = `Send ${metric(up.bitrateKbps)} kbps · RTT ${metric(up.rttMs)} ms · peak stream loss ${metric(up.lossPct, 1)}% · estimated capacity ${metric(up.availableKbps)} kbps`;
@@ -310,6 +335,11 @@ btnLeave.onclick = () => {
 };
 
 function resetSession() {
+  moderator = selfServerMuted = false;
+  moderatorLogin.reset();
+  moderatorLogin.hidden = false;
+  $('moderator-status').hidden = true;
+  $('moderation').hidden = true;
   stopQuality?.();
   stopQuality = undefined;
   $('upload-quality').textContent = '';
@@ -340,6 +370,12 @@ function backToLobby(reason: string, reconnect: boolean) {
 }
 
 // ---------- controls ----------
+moderatorLogin.onsubmit = (event) => {
+  event.preventDefault();
+  client?.claimModerator(moderatorKey.value);
+  moderatorLogin.reset();
+};
+
 btnMic.onclick = async () => {
   const session = client;
   if (deaf || micPending || !session?.canPublishVideo()) return;
