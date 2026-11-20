@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 pub const MAX_MESSAGE: usize = 64 * 1024;
 pub const MAX_PEERS: usize = 16;
 
@@ -12,6 +12,12 @@ pub enum ClientMessage {
         protocol: u32,
     },
     PubOffer {
+        sdp: String,
+    },
+    RestartIce {
+        pc: Pc,
+    },
+    PubRestartAnswer {
         sdp: String,
     },
     SubAnswer {

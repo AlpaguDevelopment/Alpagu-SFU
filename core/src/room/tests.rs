@@ -123,6 +123,17 @@ impl Client {
                         .accept_answer(self.pending.take().unwrap(), answer)
                         .unwrap();
                 }
+                "pub_restart_offer" => {
+                    let offer = SdpOffer::from_sdp_string(value["sdp"].as_str().unwrap()).unwrap();
+                    let answer = self.publisher.sdp_api().accept_offer(offer).unwrap();
+                    room.message(
+                        self.id,
+                        ClientMessage::PubRestartAnswer {
+                            sdp: answer.to_sdp_string(),
+                        },
+                    )
+                    .unwrap();
+                }
                 "sub_offer" => {
                     self.max_media_lines = self.max_media_lines.max(
                         value["sdp"]
@@ -236,6 +247,9 @@ impl Client {
 }
 #[derive(Default)]
 struct Network {
+    offline: Option<SocketAddr>,
+    // Local endpoint -> public endpoint after a simulated NAT rebinding.
+    rebound: Vec<(SocketAddr, SocketAddr)>,
     loss: Option<(SocketAddr, SocketAddr, u8, usize)>,
     dropped: bool,
     rtx: usize,
@@ -257,7 +271,29 @@ fn exchange_network(room: &mut Room, clients: &mut [Client], now: Instant, netwo
         if queue.is_empty() && !signal {
             return;
         }
-        while let Some((source, destination, bytes)) = queue.pop_front() {
+        while let Some((mut source, mut destination, bytes)) = queue.pop_front() {
+            if destination == room.address {
+                if let Some((_, public)) =
+                    network.rebound.iter().find(|(local, _)| *local == source)
+                {
+                    source = *public;
+                }
+            } else if let Some((local, _)) = network
+                .rebound
+                .iter()
+                .find(|(_, public)| *public == destination)
+            {
+                destination = *local;
+            } else if network
+                .rebound
+                .iter()
+                .any(|(local, _)| *local == destination)
+            {
+                continue;
+            }
+            if network.offline == Some(source) || network.offline == Some(destination) {
+                continue;
+            }
             let rtp = bytes.len() >= 12 && bytes[0] >> 6 == 2;
             // The synthetic clients negotiate the library's default VP8/RTX PTs (96/97).
             if rtp && bytes[1] & 0x7f == 97 {
@@ -304,6 +340,16 @@ fn exchange_network(room: &mut Room, clients: &mut [Client], now: Instant, netwo
     panic!("Exchange did not settle");
 }
 fn advance(room: &mut Room, clients: &mut [Client], now: &mut Instant, ticks: u64, audio: bool) {
+    advance_network(room, clients, now, ticks, audio, &mut Network::default());
+}
+fn advance_network(
+    room: &mut Room,
+    clients: &mut [Client],
+    now: &mut Instant,
+    ticks: u64,
+    audio: bool,
+    network: &mut Network,
+) {
     for tick in 0..ticks {
         *now += Duration::from_millis(20);
         room.timeout(*now);
@@ -314,12 +360,12 @@ fn advance(room: &mut Room, clients: &mut [Client], now: &mut Instant, ticks: u6
                 .handle_input(Input::Timeout(*now))
                 .unwrap();
         }
-        exchange(room, clients, *now);
+        exchange_network(room, clients, *now, network);
         if audio {
             for client in clients.iter_mut() {
                 client.write_audio(*now, tick);
             }
-            exchange(room, clients, *now);
+            exchange_network(room, clients, *now, network);
         }
     }
 }
@@ -372,9 +418,9 @@ fn defers_subscription_changes_until_answer() {
     let mut rx = join(&mut room, 1);
     rx.try_recv().unwrap();
     let peer = room.peers.get_mut(&1).unwrap();
-    peer.subscriptions(&[(2, MediaKind::Audio)]);
+    peer.subscriptions(&[(2, MediaKind::Audio)], room.now);
     let offer = rx.try_recv().unwrap();
-    peer.subscriptions(&[(2, MediaKind::Audio), (3, MediaKind::Audio)]);
+    peer.subscriptions(&[(2, MediaKind::Audio), (3, MediaKind::Audio)], room.now);
     assert!(rx.try_recv().is_err());
     assert_eq!(peer.slots.len(), 1);
     let mut client = Rtc::new(Instant::now());
@@ -392,7 +438,7 @@ fn defers_subscription_changes_until_answer() {
     room.peers
         .get_mut(&1)
         .unwrap()
-        .subscriptions(&[(2, MediaKind::Audio), (3, MediaKind::Audio)]);
+        .subscriptions(&[(2, MediaKind::Audio), (3, MediaKind::Audio)], room.now);
     assert_eq!(
         rx.try_recv().unwrap()["tracks"].as_array().unwrap().len(),
         2
@@ -591,4 +637,138 @@ fn full_room_negotiates_thirty_subscription_lines_within_sdp_limits() {
         assert_eq!(client.max_media_lines, 30);
         assert!(client.subscriber.is_connected());
     }
+}
+
+#[test]
+fn duplicate_name_preserves_original_and_releases_after_timeout() {
+    let mut room = test_room();
+    let mut first = join(&mut room, 1);
+    first.try_recv().unwrap();
+    let (tx, mut duplicate) = mpsc::channel(8);
+    room.command(Command::Join {
+        id: 2,
+        name: " Peer 1 ".into(),
+        tx,
+    });
+    assert_eq!(
+        duplicate.try_recv().unwrap()["message"],
+        "Name is already in use"
+    );
+    assert!(first.try_recv().is_err());
+    assert_eq!(room.peers.len(), 1);
+    let end = room.peers[&1].publisher.media_expires.unwrap();
+    room.timeout(end - Duration::from_millis(1));
+    room.pump();
+    assert!(room.peers.contains_key(&1));
+    room.timeout(end);
+    room.pump();
+    assert!(room.peers.is_empty());
+    let (tx, mut fresh) = mpsc::channel(8);
+    room.command(Command::Join {
+        id: 3,
+        name: "Peer 1".into(),
+        tx,
+    });
+    room.command(Command::Left(1));
+    assert_eq!(fresh.try_recv().unwrap()["id"], "3");
+    assert!(room.peers.contains_key(&3));
+}
+
+#[test]
+fn ice_restart_preserves_transports_membership_and_forwarding() {
+    let (mut room, mut clients, mut now) = video_room();
+    let before = clients[0].mapping.clone();
+    let old_pub = clients[0].publisher.direct_api().local_ice_credentials();
+    let old_sub = clients[0].subscriber.direct_api().local_ice_credentials();
+    let mut network = Network {
+        rebound: vec![
+            (clients[0].pub_addr, "192.0.2.44:22000".parse().unwrap()),
+            (clients[0].sub_addr, "192.0.2.44:22001".parse().unwrap()),
+        ],
+        ..Network::default()
+    };
+    for pc in [Pc::Pub, Pc::Sub] {
+        room.message(1, ClientMessage::RestartIce { pc }).unwrap();
+    }
+    advance_network(&mut room, &mut clients, &mut now, 100, false, &mut network);
+    assert_ne!(
+        clients[0].publisher.direct_api().local_ice_credentials(),
+        old_pub
+    );
+    assert_ne!(
+        clients[0].subscriber.direct_api().local_ice_credentials(),
+        old_sub
+    );
+    assert_eq!(clients[0].mapping, before);
+    for c in &mut clients {
+        c.received.clear();
+    }
+    advance_network(&mut room, &mut clients, &mut now, 30, true, &mut network);
+    for (receiver, source) in [(0, "2"), (1, "1")] {
+        let mid = clients[receiver]
+            .mapping
+            .iter()
+            .find(|t| t["peer"] == source && t["kind"] == "audio")
+            .unwrap()["mid"]
+            .as_str()
+            .unwrap();
+        assert!(
+            clients[receiver]
+                .received
+                .iter()
+                .any(|(m, data)| m.to_string() == mid && data == &[0xf8, 0xff, 0xfe])
+        );
+    }
+}
+
+#[test]
+fn losing_either_media_leg_expires_only_the_disconnected_participant() {
+    for lost_pub in [true, false] {
+        let (mut room, mut clients, mut now) = video_room();
+        let lost = if lost_pub {
+            clients[0].pub_addr
+        } else {
+            clients[0].sub_addr
+        };
+        let mut net = Network {
+            offline: Some(lost),
+            ..Network::default()
+        };
+        let start = now;
+        while now < start + MEDIA_TIMEOUT {
+            now += Duration::from_millis(100);
+            room.timeout(now);
+            for client in &mut clients {
+                client.publisher.handle_input(Input::Timeout(now)).unwrap();
+                client.subscriber.handle_input(Input::Timeout(now)).unwrap();
+            }
+            exchange_network(&mut room, &mut clients, now, &mut net);
+        }
+        assert!(!room.peers.contains_key(&1));
+        assert_eq!(room.peers.len(), 2);
+        assert!(clients[1].mapping.iter().all(|t| t["peer"] != "1"));
+    }
+}
+
+#[test]
+fn lone_connected_publisher_survives_without_subscriber_traffic() {
+    let mut room = test_room();
+    let mut now = Instant::now();
+    let mut clients = [Client::new(&mut room, 1, now)];
+    advance(&mut room, &mut clients, &mut now, 1100, false);
+    assert!(room.peers[&1].publisher.rtc.is_connected());
+    assert!(room.peers[&1].subscriber.media_expires.is_none());
+}
+
+#[test]
+fn pending_subscription_answer_expires_despite_healthy_media() {
+    let (mut room, mut clients, mut now) = video_room();
+    room.message(1, ClientMessage::RestartIce { pc: Pc::Sub })
+        .unwrap();
+    room.pump();
+    let offer = clients[0].rx.try_recv().unwrap();
+    assert_eq!(offer["type"], "sub_offer");
+    advance(&mut room, &mut clients, &mut now, 750, false);
+    assert!(!room.peers.contains_key(&1));
+    assert_eq!(room.peers.len(), 2);
 }

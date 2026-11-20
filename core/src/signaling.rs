@@ -116,8 +116,16 @@ pub async fn serve(
         return;
     }
     let mut rate = RateLimit::new(Instant::now());
+    let mut probe = tokio::time::interval(Duration::from_secs(4));
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    probe.tick().await;
+    let mut last_pong = tokio::time::Instant::now();
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(last_pong + Duration::from_secs(15)) => break,
+            _ = probe.tick() => {
+                if !matches!(timeout(Duration::from_secs(2), ws.send(Message::Ping(Default::default()))).await, Ok(Ok(()))) { break; }
+            }
             outgoing = rx.recv() => {
                 let Some(value) = outgoing else { break; };
                 let fatal = value.get("fatal").and_then(Value::as_bool) == Some(true);
@@ -134,7 +142,7 @@ pub async fn serve(
                         }
                     }
                     Some(Ok(Message::Ping(_))) => { if !matches!(timeout(Duration::from_secs(2), ws.flush()).await, Ok(Ok(()))) { break; } }
-                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Pong(_))) => last_pong = tokio::time::Instant::now(),
                     _ => break,
                 }
             }
@@ -188,6 +196,33 @@ mod socket_tests {
     }
 
     #[tokio::test]
+    async fn silent_websocket_is_removed_even_if_the_room_keeps_it_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let (commands, mut received) = mpsc::channel(4);
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            serve(tcp, 7, commands, Arc::new(Semaphore::new(1))).await;
+        });
+        let (mut ws, _) = connect_async(url).await.unwrap();
+        send(
+            &mut ws,
+            json!({"type":"join", "name":"Silent", "protocol":protocol::PROTOCOL}),
+        )
+        .await;
+        let Some(Command::Join { tx, .. }) = received.recv().await else {
+            panic!("Expected a join");
+        };
+        // Keep both ends open without polling the client, so it cannot return a Pong.
+        let next = timeout(Duration::from_secs(18), received.recv())
+            .await
+            .unwrap();
+        assert!(matches!(next, Some(Command::Left(7))));
+        server.await.unwrap();
+        drop((tx, ws));
+    }
+
+    #[tokio::test]
     async fn websocket_join_state_ping_invalid_input_and_disconnect() {
         str0m::crypto::from_feature_flags().install_process_default();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -210,14 +245,14 @@ mod socket_tests {
         let (mut first, _) = connect_async(&url).await.unwrap();
         send(
             &mut first,
-            json!({"type":"join","name":"First","protocol":2}),
+            json!({"type":"join","name":"First","protocol":protocol::PROTOCOL}),
         )
         .await;
         assert_eq!(receive(&mut first).await["type"], "joined");
         let (mut second, _) = connect_async(&url).await.unwrap();
         send(
             &mut second,
-            json!({"type":"join","name":"Second","protocol":2}),
+            json!({"type":"join","name":"Second","protocol":protocol::PROTOCOL}),
         )
         .await;
         assert_eq!(
@@ -250,7 +285,7 @@ mod socket_tests {
         let (mut oversized, _) = connect_async(&url).await.unwrap();
         send(
             &mut oversized,
-            json!({"type":"join","name":"Large","protocol":2}),
+            json!({"type":"join","name":"Large","protocol":protocol::PROTOCOL}),
         )
         .await;
         receive(&mut oversized).await;
